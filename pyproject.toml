@@ -1,0 +1,16 @@
+[project]
+name = "aki"
+dynamic = ["version"]
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["aki"]  # package names should match these glob patterns (["*"] by default)
+
+[build-system]
+requires = ["setuptools", "setuptools_scm"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+
+[project.urls]
+Homepage = "https://github.com/sot/aki"
