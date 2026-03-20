@@ -1,5 +1,6 @@
 import numba
 import numpy as np
+from chandra_aca.aca_image import AcaPsfLibrary
 
 __all__ = ["calc_legacy_flight_bgd", "centroid_fm"]
 
@@ -29,6 +30,8 @@ MOUSE_BIT_ROWS = np.concatenate(
         [6, 6, 6, 6],
     ]
 )
+
+APL = AcaPsfLibrary()
 
 
 def make_psf_images(n_rc=11):
@@ -143,11 +146,18 @@ def centroid_fm(img: np.ndarray, bgd_est: np.ndarray):
     cent_row_sum = 0.0
     cent_col_sum = 0.0
 
-    for ii, jj in zip(MOUSE_BIT_ROWS, MOUSE_BIT_COLS):
-        img_bgd_sub = img[ii, jj] - bgd_est[ii, jj]
-        norm += img_bgd_sub
-        cent_row_sum += ii * img_bgd_sub
-        cent_col_sum += jj * img_bgd_sub
+    if isinstance(bgd_est, float):
+        for ii, jj in zip(MOUSE_BIT_ROWS, MOUSE_BIT_COLS):
+            img_bgd_sub = img[ii, jj] - bgd_est
+            norm += img_bgd_sub
+            cent_row_sum += ii * img_bgd_sub
+            cent_col_sum += jj * img_bgd_sub
+    else:
+        for ii, jj in zip(MOUSE_BIT_ROWS, MOUSE_BIT_COLS):
+            img_bgd_sub = img[ii, jj] - bgd_est[ii, jj]
+            norm += img_bgd_sub
+            cent_row_sum += ii * img_bgd_sub
+            cent_col_sum += jj * img_bgd_sub
 
     if norm < 10.0:
         norm = 10.0
@@ -175,3 +185,37 @@ def get_psf_image_from_grid(row: float, col: float, norm: float, img: np.ndarray
         for jj in range(8):
             img[ii, jj] = PSF_IMGS_GRID[row_idx, col_idx, ii, jj] * norm
     return row_int - 4, col_int - 4
+
+
+@numba.njit()
+def clip(val: int, low: int, high: int):
+    if val < low:
+        return low
+    elif val > high:
+        return high
+    else:
+        return val
+
+
+@numba.njit()
+def shine_star_image(
+    img: np.ndarray,
+    img_row0: int,
+    img_col0: int,
+    star_row: float,
+    star_col: float,
+    star_norm: float,
+    star_img: np.ndarray,
+):
+    star_row -= img_row0
+    star_col -= img_col0
+    star_row0, star_col0 = get_psf_image_from_grid(
+        star_row, star_col, star_norm, star_img
+    )
+    row0 = clip(star_row0, 0, 8)
+    row1 = clip(star_row0 + 8, 0, 8)
+    col0 = clip(star_col0, 0, 8)
+    col1 = clip(star_col0 + 8, 0, 8)
+    img[row0:row1, col0:col1] += star_img[
+        row0 - star_row0 : row1 - star_row0, col0 - star_col0 : col1 - star_col0
+    ]
