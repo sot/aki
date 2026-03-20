@@ -31,6 +31,30 @@ MOUSE_BIT_ROWS = np.concatenate(
 )
 
 
+def make_psf_images(n_rc=11):
+    """Grid of PSF images for rows/cols in range -0.5 to 0.5 with n_rc points."""
+    rc_vals = np.linspace(-0.5, 0.5, n_rc)
+    cols, rows = np.meshgrid(rc_vals, rc_vals)
+    imgs = np.zeros(rows.shape + (8, 8), dtype=np.float64)
+    for ii in range(rows.shape[0]):
+        for jj in range(rows.shape[1]):
+            star_img, star_row0, star_col0 = APL.get_psf_image(
+                rows[ii, jj],
+                cols[ii, jj],
+                norm=1.0,
+                pix_zero_loc="edge",
+                aca_image=False,
+            )
+            if star_row0 != -4 or star_col0 != -4:
+                raise ValueError
+            imgs[ii, jj] = star_img
+    return imgs
+
+
+# Could write this to a file but it only takes 18 ms
+PSF_IMGS_GRID = make_psf_images(51)
+
+
 @numba.njit()
 def calc_legacy_flight_bgd(img: np.ndarray[np.float64]):
     """Compute the legacy flight background algorithm.
@@ -97,9 +121,7 @@ def centroid_fm(img: np.ndarray, bgd_est: np.ndarray):
     """
     First moment centroid of ``img``.
 
-    Return FM centroid in coords where lower left pixel of image has value
-    (0.0, 0.0) at the center (for pix_zero_loc='center') or the lower-left edge
-    (for pix_zero_loc='edge').
+    Return FM centroid of image relative to the exact center of the 8x8 image.
 
     Parameters
     ----------
@@ -135,3 +157,21 @@ def centroid_fm(img: np.ndarray, bgd_est: np.ndarray):
     cent_col = cent_col_sum / norm + 0.5
 
     return cent_row, cent_col, norm
+
+
+@numba.njit()
+def get_psf_image_from_grid(row: float, col: float, norm: float, img: np.ndarray):
+    """Get PSF image from grid for given row/col and normalize."""
+    # Find the nearest integer row/col and the fractional part. Need to use floor and
+    # not round because round goes up for e.g. 25.5 and down for 24.5.
+    row_int = int(np.floor(row + 0.5))
+    col_int = int(np.floor(col + 0.5))
+    row -= row_int
+    col -= col_int
+    n_rc = PSF_IMGS_GRID.shape[0]
+    row_idx = int(round((row + 0.5) * (n_rc - 1)))
+    col_idx = int(round((col + 0.5) * (n_rc - 1)))
+    for ii in range(8):
+        for jj in range(8):
+            img[ii, jj] = PSF_IMGS_GRID[row_idx, col_idx, ii, jj] * norm
+    return row_int - 4, col_int - 4
