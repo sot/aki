@@ -120,7 +120,7 @@ def calc_legacy_flight_bgd(img: np.ndarray[np.float64]):
 
 
 @numba.njit()
-def centroid_fm(img: np.ndarray, bgd_est: np.ndarray):
+def centroid_fm(img: np.ndarray, bgd_est: float | np.ndarray):
     """
     First moment centroid of ``img``.
 
