@@ -1,6 +1,12 @@
+import itertools
+
+import agasc
+import astropy.table as apt
 import numba
 import numpy as np
+from chandra_aca import transform
 from chandra_aca.aca_image import AcaPsfLibrary
+from mica.archive.aca_dark import get_dark_cal_image
 
 __all__ = ["calc_legacy_flight_bgd", "centroid_fm"]
 
@@ -219,3 +225,131 @@ def shine_star_image(
     img[row0:row1, col0:col1] += star_img[
         row0 - star_row0 : row1 - star_row0, col0 - star_col0 : col1 - star_col0
     ]
+
+
+def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
+    # Find all stars with centroid within a 9-pixel halfw box of guide
+    # Note pix_zero_loc = 'edge' for all these.
+    guide_row_cat = guide["row"]
+    guide_col_cat = guide["col"]
+    ok = (np.abs(stars["row"] - guide_row_cat) < 9) & (
+        np.abs(stars["col"] - guide_col_cat) < 9
+    )
+    star_row0s = stars["row"][ok]
+    star_col0s = stars["col"][ok]
+    star_norms = transform.mag_to_count_rate(stars["mag"][ok])
+    # print(star_norms)
+    star_img = np.empty((8, 8), dtype=float)
+
+    img_row = guide_row_cat
+    img_col = guide_col_cat
+
+    # Initial rate
+    rate_row = 0.0
+    rate_col = 0.0
+
+    n_sim = len(dither_rs)
+    cent_rows = np.zeros(n_sim, dtype=np.float64)
+    cent_cols = np.zeros_like(dither_rs, dtype=np.float64)
+    star_rows = np.zeros(n_sim, dtype=np.float64)
+    star_cols = np.zeros_like(dither_rs, dtype=np.float64)
+    norms = np.zeros_like(dither_rs, dtype=np.float64)
+    img_row0s = np.zeros_like(dither_rs, dtype=np.int32)
+    img_col0s = np.zeros_like(dither_rs, dtype=np.int32)
+
+    for idx, dither_r, dither_c in zip(itertools.count(), dither_rs, dither_cs):
+        # Next image location center as floats
+        img_row = clip(img_row + rate_row, -508.0, 508.0)
+        img_col = clip(img_col + rate_col, -508.0, 508.0)
+
+        # Image readout lower left corner
+        img_row0 = int(round(img_row)) - 4
+        img_col0 = int(round(img_col)) - 4
+        img_row0s[idx] = img_row0
+        img_col0s[idx] = img_col0
+
+        img = dark[
+            img_row0 + 512 : img_row0 + 512 + 8, img_col0 + 512 : img_col0 + 512 + 8
+        ].copy()
+
+        # Shine star images onto img
+        for star_row0, star_col0, star_norm in zip(star_row0s, star_col0s, star_norms):
+            star_row = star_row0 + dither_r
+            star_col = star_col0 + dither_c
+            shine_star_image(
+                img, img_row0, img_col0, star_row, star_col, star_norm, star_img
+            )
+
+        star_rows[idx] = guide_row_cat + dither_r
+        star_cols[idx] = guide_col_cat + dither_c
+
+        # bgd = calc_legacy_flight_bgd(np.asarray(img, dtype=np.float64))
+        bgd = 30.0
+        cent_row0, cent_col0, cent_norm = centroid_fm(img, bgd)
+        cent_rows[idx] = cent_row0 + img_row0
+        cent_cols[idx] = cent_col0 + img_col0
+        norms[idx] = cent_norm
+
+        rate_row = cent_rows[idx] - img_row
+        rate_col = cent_cols[idx] - img_col
+
+    out = {
+        "star_row": star_rows,
+        "star_col": star_cols,
+        "cent_row": cent_rows,
+        "cent_col": cent_cols,
+        "norm": norms,
+        "img_row0": img_row0s,
+        "img_col0": img_col0s,
+    }
+
+    return apt.Table(out)
+
+
+def run_aki_from_sim_obs(obsid, duration=None):
+    from annie import sim_obs
+
+    ao = sim_obs.AnnieObservation(obsid, duration)
+    duration = ao.duration
+    dither = ao.obs.dither
+    dark = get_dark_cal_image(ao.obs.start, select="nearest", t_ccd_ref=ao.obs.t_ccd)
+
+    dt = 2.05
+    n_read = int(duration // dt)
+    times = np.arange(n_read) * dt
+
+    # pitch <=> col, yaw <=> row
+    period_r = dither.yaw_period
+    period_c = dither.pitch_period
+    phase_r = dither.yaw_phase
+    phase_c = dither.pitch_phase
+    ampl_r = dither.yaw_ampl / 5.0
+    ampl_c = dither.pitch_ampl / 5.0
+    omega_r = 2 * np.pi / period_r
+    omega_c = 2 * np.pi / period_c
+    dither_rs = ampl_r * np.sin(omega_r * times + phase_r)
+    dither_cs = ampl_c * np.sin(omega_c * times + phase_c)
+
+    att_targ = ao.obs.att_targ
+    stars = agasc.get_agasc_cone(att_targ.ra, att_targ.dec, 1.4)
+    stars_yag, stars_zag = transform.radec_to_yagzag(
+        stars["RA_PMCORR"], stars["DEC_PMCORR"], att_targ
+    )
+    stars["row"], stars["col"] = transform.yagzag_to_pixels(stars_yag, stars_zag)
+    stars["mag"] = stars["MAG_ACA"]
+
+    starcat = ao.obs.starcat
+    ok = np.isin(starcat["type"], ["BOT", "GUI"])
+    guides = starcat[ok]
+    guides["row"], guides["col"] = transform.yagzag_to_pixels(
+        guides["yang"],
+        guides["zang"],
+        t_aca=ao.obs.t_ccd + 41,
+    )
+
+    sdrs = {}
+    for guide in guides:
+        sdr = star_track_numba(guide, dither_rs, dither_cs, dark=dark, stars=stars)
+        sdrs[guide["slot"]] = sdr
+
+    return sdrs, ao
