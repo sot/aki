@@ -7,6 +7,7 @@ import numpy as np
 from chandra_aca import transform
 from chandra_aca.aca_image import AcaPsfLibrary
 from mica.archive.aca_dark import get_dark_cal_image
+from ska_trend.centroid_dashboard import app as cent_app
 
 __all__ = ["calc_legacy_flight_bgd", "centroid_fm"]
 
@@ -177,7 +178,31 @@ def centroid_fm(img: np.ndarray, bgd_est: float | np.ndarray):
 
 @numba.njit()
 def get_psf_image_from_grid(row: float, col: float, norm: float, img: np.ndarray):
-    """Get PSF image from grid for given row/col and normalize."""
+    """Look up an 8x8 PSF image from ``PSF_IMGS_GRID`` for a given sub-pixel position.
+
+    The PSF grid is indexed by fractional row/col offset from the nearest integer
+    pixel (see ``make_psf_images``), so this splits ``row``/``col`` into an integer
+    part (the image lower-left corner offset) and a fractional part used to select
+    the nearest pre-computed PSF sample, which is then scaled by ``norm``.
+
+    Parameters
+    ----------
+    row : float
+        Star row position in pixel coordinates.
+    col : float
+        Star column position in pixel coordinates.
+    norm : float
+        Total flux to scale the PSF image by (e-/s).
+    img : np.ndarray
+        8x8 output array that is filled in-place with the scaled PSF image.
+
+    Returns
+    -------
+    row0 : int
+        Row offset of the image lower-left corner relative to ``row``.
+    col0 : int
+        Column offset of the image lower-left corner relative to ``col``.
+    """
     # Find the nearest integer row/col and the fractional part. Need to use floor and
     # not round because round goes up for e.g. 25.5 and down for 24.5.
     row_int = int(np.floor(row + 0.5))
@@ -195,6 +220,22 @@ def get_psf_image_from_grid(row: float, col: float, norm: float, img: np.ndarray
 
 @numba.njit()
 def clip(val: int, low: int, high: int):
+    """Clip ``val`` to the closed interval ``[low, high]``.
+
+    Parameters
+    ----------
+    val : int
+        Value to clip.
+    low : int
+        Lower bound.
+    high : int
+        Upper bound.
+
+    Returns
+    -------
+    int
+        ``val`` clamped to ``[low, high]``.
+    """
     if val < low:
         return low
     elif val > high:
@@ -213,6 +254,30 @@ def shine_star_image(
     star_norm: float,
     star_img: np.ndarray,
 ):
+    """Add a star's PSF image onto ``img`` in-place at the appropriate location.
+
+    Looks up the PSF for the star's position relative to the image's lower-left
+    corner (``img_row0``, ``img_col0``) via ``get_psf_image_from_grid``, then adds
+    the (possibly clipped, if it extends beyond the 8x8 ``img`` bounds) overlapping
+    portion of that PSF onto ``img``.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        8x8 image array to add the star's PSF onto, modified in-place.
+    img_row0 : int
+        Row of the lower-left corner of ``img`` in absolute pixel coordinates.
+    img_col0 : int
+        Column of the lower-left corner of ``img`` in absolute pixel coordinates.
+    star_row : float
+        Star row position in absolute pixel coordinates.
+    star_col : float
+        Star column position in absolute pixel coordinates.
+    star_norm : float
+        Total star flux (e-/s) used to scale the PSF image.
+    star_img : np.ndarray
+        8x8 scratch array used to hold the star's PSF image, overwritten in-place.
+    """
     star_row -= img_row0
     star_col -= img_col0
     star_row0, star_col0 = get_psf_image_from_grid(
@@ -228,6 +293,37 @@ def shine_star_image(
 
 
 def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
+    """Simulate ACA image-readout tracking of a single guide star over time.
+
+    For each dither offset in ``dither_rs``/``dither_cs``, this synthesizes an 8x8
+    ACA readout image (dark current plus PSF images of nearby stars from ``stars``),
+    computes a first-moment centroid, and updates the tracked image position for the
+    next readout using a simple rate-based tracking loop. Tracking is dropped if the
+    image sum falls below a minimum threshold or if the guide star loss counter (GS
+    loss) exceeds its limit, in which case tracking resets to the catalog position.
+
+    Parameters
+    ----------
+    guide : dict-like
+        Guide star catalog entry with fields ``row``, ``col``, ``maxmag``, and
+        ``slot``, in pixel coordinates (``pix_zero_loc='edge'``).
+    dither_rs : np.ndarray
+        Dither offset in row (pixels) at each simulated readout.
+    dither_cs : np.ndarray
+        Dither offset in column (pixels) at each simulated readout.
+    dark : np.ndarray
+        Full dark current CCD image (e-/s) used as the image background.
+    stars : dict-like / table
+        Candidate stars near the guide star, with fields ``row``, ``col``, ``mag``.
+
+    Returns
+    -------
+    dict
+        Dictionary of per-readout arrays with keys ``time``, ``star_row``,
+        ``star_col`` (true guide star position including dither), ``cent_row``,
+        ``cent_col`` (computed centroid), ``img_sum``, ``img_row0``, ``img_col0``
+        (readout image lower-left corner), and ``img_track`` (bool tracking state).
+    """
     # Find all stars with centroid within a 9-pixel halfw box of guide
     # Note pix_zero_loc = 'edge' for all these.
     guide_row_cat = guide["row"]
@@ -241,6 +337,9 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
     # print(star_norms)
     star_img = np.empty((8, 8), dtype=float)
 
+    # Below this threshold stop tracking
+    min_img_sum = transform.mag_to_count_rate(guide["maxmag"]) / 2
+
     img_row = guide_row_cat
     img_col = guide_col_cat
 
@@ -248,14 +347,18 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
     rate_row = 0.0
     rate_col = 0.0
 
+    gs_loss_count = 0
+    img_track = True
+
     n_sim = len(dither_rs)
     cent_rows = np.zeros(n_sim, dtype=np.float64)
-    cent_cols = np.zeros_like(dither_rs, dtype=np.float64)
+    cent_cols = np.zeros(n_sim, dtype=np.float64)
     star_rows = np.zeros(n_sim, dtype=np.float64)
-    star_cols = np.zeros_like(dither_rs, dtype=np.float64)
-    norms = np.zeros_like(dither_rs, dtype=np.float64)
-    img_row0s = np.zeros_like(dither_rs, dtype=np.int32)
-    img_col0s = np.zeros_like(dither_rs, dtype=np.int32)
+    star_cols = np.zeros(n_sim, dtype=np.float64)
+    img_sums = np.zeros(n_sim, dtype=np.float64)
+    img_row0s = np.zeros(n_sim, dtype=np.int32)
+    img_col0s = np.zeros(n_sim, dtype=np.int32)
+    img_tracks = np.zeros(n_sim, dtype=bool)
 
     for idx, dither_r, dither_c in zip(itertools.count(), dither_rs, dither_cs):
         # Next image location center as floats
@@ -280,33 +383,94 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
                 img, img_row0, img_col0, star_row, star_col, star_norm, star_img
             )
 
-        star_rows[idx] = guide_row_cat + dither_r
-        star_cols[idx] = guide_col_cat + dither_c
+        guide_row = guide_row_cat + dither_r
+        guide_col = guide_col_cat + dither_c
+        star_rows[idx] = guide_row
+        star_cols[idx] = guide_col
 
         # bgd = calc_legacy_flight_bgd(np.asarray(img, dtype=np.float64))
         bgd = 30.0
-        cent_row0, cent_col0, cent_norm = centroid_fm(img, bgd)
-        cent_rows[idx] = cent_row0 + img_row0
-        cent_cols[idx] = cent_col0 + img_col0
-        norms[idx] = cent_norm
+        # Centroid row/col relative to lower left pixel edge at 0, 0
+        cent_row0, cent_col0, img_sum = centroid_fm(img, bgd)
+        # Centroid row/col in absolute coordinates (with 0, 0 at the CCD center)
+        cent_row = cent_row0 + img_row0
+        cent_col = cent_col0 + img_col0
+        cent_rows[idx] = cent_row
+        cent_cols[idx] = cent_col
+        img_sums[idx] = img_sum
 
-        rate_row = cent_rows[idx] - img_row
-        rate_col = cent_cols[idx] - img_col
+        if img_sum < min_img_sum:
+            img_track = False
+
+        img_tracks[idx] = img_track
+
+        if not img_track:
+            # Corresponds to RACQ state with star below threshold and not tracking.
+            rate_row = 0.0
+            rate_col = 0.0
+        else:
+            rate_row = cent_row - img_row
+            rate_col = cent_col - img_col
+
+        if (
+            not img_track
+            or abs(guide_row - cent_row) > 1.0  # 1 pixel = 5 arcsec
+            or abs(guide_col - cent_col) > 1.0
+        ):
+            gs_loss_count += 1
+
+        # PCAD GS_loss_count threshold is 100 readouts at 1.025 s/readout. Here we
+        # simulate only each 2.05 s image read.
+        if gs_loss_count > 50:
+            gs_loss_count = 0
+            rate_row = 0.0
+            rate_col = 0.0
+            img_row = guide_row
+            img_col = guide_col
 
     out = {
+        "time": np.arange(n_sim) * 2.05,
         "star_row": star_rows,
         "star_col": star_cols,
         "cent_row": cent_rows,
         "cent_col": cent_cols,
-        "norm": norms,
+        "img_sum": img_sums,
         "img_row0": img_row0s,
         "img_col0": img_col0s,
+        "img_track": img_tracks,
     }
 
-    return apt.Table(out)
+    return out
 
 
 def run_aki_from_sim_obs(obsid, duration=None):
+    """Run the guide star tracking simulation for a simulated observation (obsid).
+
+    Builds a simulated observation via ``annie.sim_obs.AnnieObservation``, derives
+    the dither motion, dark current image, and candidate/guide star catalogs for
+    that observation, then runs ``star_track_numba`` for each guide star and wraps
+    the results in ``CentroidResidualsLite`` objects for comparison against the
+    true (dithered) star positions.
+
+    Parameters
+    ----------
+    obsid : int
+        Observation ID to simulate.
+    duration : float, optional
+        Observation duration in seconds. If not given, uses the full duration from
+        the simulated observation.
+
+    Returns
+    -------
+    sdrs : dict
+        Per-slot dictionary of simulated tracking results, keyed by guide star slot
+        (see ``star_track_numba`` return value for the per-slot dict contents).
+    crs_sim : dict
+        Per-slot dictionary of ``CentroidResidualsLite`` objects built from the
+        centroid residuals (dyag/dzag) in ``sdrs``.
+    ao : annie.sim_obs.AnnieObservation
+        The simulated observation object.
+    """
     from annie import sim_obs
 
     ao = sim_obs.AnnieObservation(obsid, duration)
@@ -352,4 +516,13 @@ def run_aki_from_sim_obs(obsid, duration=None):
         sdr = star_track_numba(guide, dither_rs, dither_cs, dark=dark, stars=stars)
         sdrs[guide["slot"]] = sdr
 
-    return sdrs, ao
+    crs_sim = {}
+    for slot, sdr in sdrs.items():
+        crs_sim[slot] = cent_app.CentroidResidualsLite(
+            dyags=(sdr["cent_row"] - sdr["star_row"]) * 5.0,
+            dzags=(sdr["cent_col"] - sdr["star_col"]) * 5.0,
+            yag_times=sdr["time"],
+            zag_times=sdr["time"],
+        )
+
+    return sdrs, crs_sim, ao
