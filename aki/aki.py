@@ -292,6 +292,137 @@ def shine_star_image(
     ]
 
 
+@numba.njit()
+def _advance_readout(
+    dither_r,
+    dither_c,
+    guide_row_cat,
+    guide_col_cat,
+    star_row0s,
+    star_col0s,
+    star_norms,
+    star_img,
+    dark,
+    min_img_sum,
+    img_row,
+    img_col,
+    rate_row,
+    rate_col,
+    gs_loss_count,
+    img_track,
+):
+    """Advance guide-star tracking by one simulated readout.
+
+    Synthesizes the 8x8 readout image at the current tracked position, adds
+    nearby star PSFs, computes a first-moment centroid, and updates the
+    tracking rate and GS-loss state for the next readout.
+
+    Parameters
+    ----------
+    dither_r, dither_c : float
+        Dither offset (pixels) at this readout.
+    guide_row_cat, guide_col_cat : float
+        Guide star catalog position (pixels), before dither.
+    star_row0s, star_col0s, star_norms : np.ndarray
+        Catalog positions (pixels) and count rates (e-/s) of candidate stars
+        near the guide star.
+    star_img : np.ndarray
+        8x8 scratch array used to hold a star's PSF image.
+    dark : np.ndarray
+        Full dark current CCD image (e-/s) used as the image background.
+    min_img_sum : float
+        Image flux (e-/s) threshold below which tracking is dropped.
+    img_row, img_col, rate_row, rate_col, gs_loss_count, img_track
+        Tracking state carried over from the previous readout.
+
+    Returns
+    -------
+    cent_row, cent_col : float
+        Computed centroid in absolute pixel coordinates.
+    img_sum : float
+        Background-subtracted image flux (e-/s).
+    img_row0, img_col0 : int
+        Readout image lower-left corner in absolute pixel coordinates.
+    star_row, star_col : float
+        True (dithered) guide star position.
+    img_row, img_col, rate_row, rate_col, gs_loss_count, img_track
+        Updated tracking state for the next readout.
+    """
+    # Next image location center as floats
+    img_row = clip(img_row + rate_row, -508.0, 508.0)
+    img_col = clip(img_col + rate_col, -508.0, 508.0)
+
+    # Image readout lower left corner
+    img_row0 = int(round(img_row)) - 4
+    img_col0 = int(round(img_col)) - 4
+
+    img = dark[
+        img_row0 + 512 : img_row0 + 512 + 8, img_col0 + 512 : img_col0 + 512 + 8
+    ].copy()
+
+    # Shine star images onto img
+    for star_row0, star_col0, star_norm in zip(star_row0s, star_col0s, star_norms):
+        star_row = star_row0 + dither_r
+        star_col = star_col0 + dither_c
+        shine_star_image(
+            img, img_row0, img_col0, star_row, star_col, star_norm, star_img
+        )
+
+    guide_row = guide_row_cat + dither_r
+    guide_col = guide_col_cat + dither_c
+
+    # bgd = calc_legacy_flight_bgd(np.asarray(img, dtype=np.float64))
+    bgd = 30.0
+    # Centroid row/col relative to lower left pixel edge at 0, 0
+    cent_row0, cent_col0, img_sum = centroid_fm(img, bgd)
+    # Centroid row/col in absolute coordinates (with 0, 0 at the CCD center)
+    cent_row = cent_row0 + img_row0
+    cent_col = cent_col0 + img_col0
+
+    if img_sum < min_img_sum:
+        img_track = False
+
+    if not img_track:
+        # Corresponds to RACQ state with star below threshold and not tracking.
+        rate_row = 0.0
+        rate_col = 0.0
+    else:
+        rate_row = cent_row - img_row
+        rate_col = cent_col - img_col
+
+    if (
+        not img_track
+        or abs(guide_row - cent_row) > 1.0  # 1 pixel = 5 arcsec
+        or abs(guide_col - cent_col) > 1.0
+    ):
+        gs_loss_count += 1
+
+    # PCAD GS_loss_count threshold is 100 readouts at 1.025 s/readout. Here we
+    # simulate only each 2.05 s image read.
+    if gs_loss_count > 50:
+        gs_loss_count = 0
+        rate_row = 0.0
+        rate_col = 0.0
+        img_row = guide_row
+        img_col = guide_col
+
+    return (
+        cent_row,
+        cent_col,
+        img_sum,
+        img_row0,
+        img_col0,
+        guide_row,
+        guide_col,
+        img_row,
+        img_col,
+        rate_row,
+        rate_col,
+        gs_loss_count,
+        img_track,
+    )
+
+
 def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
     """Simulate ACA image-readout tracking of a single guide star over time.
 
@@ -326,19 +457,21 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
     """
     # Find all stars with centroid within a 9-pixel halfw box of guide
     # Note pix_zero_loc = 'edge' for all these.
-    guide_row_cat = guide["row"]
-    guide_col_cat = guide["col"]
+    guide_row_cat = float(guide["row"])
+    guide_col_cat = float(guide["col"])
     ok = (np.abs(stars["row"] - guide_row_cat) < 9) & (
         np.abs(stars["col"] - guide_col_cat) < 9
     )
-    star_row0s = stars["row"][ok]
-    star_col0s = stars["col"][ok]
-    star_norms = transform.mag_to_count_rate(stars["mag"][ok])
+    star_row0s = np.asarray(stars["row"][ok], dtype=np.float64)
+    star_col0s = np.asarray(stars["col"][ok], dtype=np.float64)
+    star_norms = np.asarray(
+        transform.mag_to_count_rate(stars["mag"][ok]), dtype=np.float64
+    )
     # print(star_norms)
     star_img = np.empty((8, 8), dtype=float)
 
     # Below this threshold stop tracking
-    min_img_sum = transform.mag_to_count_rate(guide["maxmag"]) / 2
+    min_img_sum = float(transform.mag_to_count_rate(guide["maxmag"])) / 2
 
     img_row = guide_row_cat
     img_col = guide_col_cat
@@ -361,72 +494,39 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
     img_tracks = np.zeros(n_sim, dtype=bool)
 
     for idx, dither_r, dither_c in zip(itertools.count(), dither_rs, dither_cs):
-        # Next image location center as floats
-        img_row = clip(img_row + rate_row, -508.0, 508.0)
-        img_col = clip(img_col + rate_col, -508.0, 508.0)
-
-        # Image readout lower left corner
-        img_row0 = int(round(img_row)) - 4
-        img_col0 = int(round(img_col)) - 4
-        img_row0s[idx] = img_row0
-        img_col0s[idx] = img_col0
-
-        img = dark[
-            img_row0 + 512 : img_row0 + 512 + 8, img_col0 + 512 : img_col0 + 512 + 8
-        ].copy()
-
-        # Shine star images onto img
-        for star_row0, star_col0, star_norm in zip(star_row0s, star_col0s, star_norms):
-            star_row = star_row0 + dither_r
-            star_col = star_col0 + dither_c
-            shine_star_image(
-                img, img_row0, img_col0, star_row, star_col, star_norm, star_img
-            )
-
-        guide_row = guide_row_cat + dither_r
-        guide_col = guide_col_cat + dither_c
-        star_rows[idx] = guide_row
-        star_cols[idx] = guide_col
-
-        # bgd = calc_legacy_flight_bgd(np.asarray(img, dtype=np.float64))
-        bgd = 30.0
-        # Centroid row/col relative to lower left pixel edge at 0, 0
-        cent_row0, cent_col0, img_sum = centroid_fm(img, bgd)
-        # Centroid row/col in absolute coordinates (with 0, 0 at the CCD center)
-        cent_row = cent_row0 + img_row0
-        cent_col = cent_col0 + img_col0
-        cent_rows[idx] = cent_row
-        cent_cols[idx] = cent_col
-        img_sums[idx] = img_sum
-
-        if img_sum < min_img_sum:
-            img_track = False
-
+        (
+            cent_rows[idx],
+            cent_cols[idx],
+            img_sums[idx],
+            img_row0s[idx],
+            img_col0s[idx],
+            star_rows[idx],
+            star_cols[idx],
+            img_row,
+            img_col,
+            rate_row,
+            rate_col,
+            gs_loss_count,
+            img_track,
+        ) = _advance_readout(
+            dither_r,
+            dither_c,
+            guide_row_cat,
+            guide_col_cat,
+            star_row0s,
+            star_col0s,
+            star_norms,
+            star_img,
+            dark,
+            min_img_sum,
+            img_row,
+            img_col,
+            rate_row,
+            rate_col,
+            gs_loss_count,
+            img_track,
+        )
         img_tracks[idx] = img_track
-
-        if not img_track:
-            # Corresponds to RACQ state with star below threshold and not tracking.
-            rate_row = 0.0
-            rate_col = 0.0
-        else:
-            rate_row = cent_row - img_row
-            rate_col = cent_col - img_col
-
-        if (
-            not img_track
-            or abs(guide_row - cent_row) > 1.0  # 1 pixel = 5 arcsec
-            or abs(guide_col - cent_col) > 1.0
-        ):
-            gs_loss_count += 1
-
-        # PCAD GS_loss_count threshold is 100 readouts at 1.025 s/readout. Here we
-        # simulate only each 2.05 s image read.
-        if gs_loss_count > 50:
-            gs_loss_count = 0
-            rate_row = 0.0
-            rate_col = 0.0
-            img_row = guide_row
-            img_col = guide_col
 
     out = {
         "time": np.arange(n_sim) * 2.05,
