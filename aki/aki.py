@@ -6,6 +6,7 @@ import numba
 import numpy as np
 from chandra_aca import transform
 from chandra_aca.aca_image import AcaPsfLibrary
+from cxotime import CxoTime
 from mica.archive.aca_dark import get_dark_cal_image
 from ska_trend.centroid_dashboard import app as cent_app
 
@@ -543,7 +544,7 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
     return out
 
 
-def run_aki_from_sim_obs(obsid, duration=None):
+def run_aki_from_sim_obs(obsid, duration=None, dither_source="sinusoid"):
     """Run the guide star tracking simulation for a simulated observation (obsid).
 
     Builds a simulated observation via ``annie.sim_obs.AnnieObservation``, derives
@@ -559,6 +560,11 @@ def run_aki_from_sim_obs(obsid, duration=None):
     duration : float, optional
         Observation duration in seconds. If not given, uses the full duration from
         the simulated observation.
+    dither_source : str, optional
+        Source of the dither motion, either ``"sinusoid"`` (default) to generate
+        ideal sinusoidal dither from the commanded dither parameters, or
+        ``"flight-att"`` to derive the dither from the flight attitude telemetry
+        (``AOATTQT``) relative to the target attitude.
 
     Returns
     -------
@@ -573,6 +579,11 @@ def run_aki_from_sim_obs(obsid, duration=None):
     """
     from annie import sim_obs
 
+    if dither_source not in ("sinusoid", "flight-att"):
+        raise ValueError(
+            f"dither_source must be 'sinusoid' or 'flight-att', not {dither_source!r}"
+        )
+
     ao = sim_obs.AnnieObservation(obsid, duration)
     duration = ao.duration
     dither = ao.obs.dither
@@ -583,16 +594,10 @@ def run_aki_from_sim_obs(obsid, duration=None):
     times = np.arange(n_read) * dt
 
     # pitch <=> col, yaw <=> row
-    period_r = dither.yaw_period
-    period_c = dither.pitch_period
-    phase_r = dither.yaw_phase
-    phase_c = dither.pitch_phase
-    ampl_r = dither.yaw_ampl / 5.0
-    ampl_c = dither.pitch_ampl / 5.0
-    omega_r = 2 * np.pi / period_r
-    omega_c = 2 * np.pi / period_c
-    dither_rs = ampl_r * np.sin(omega_r * times + phase_r)
-    dither_cs = ampl_c * np.sin(omega_c * times + phase_c)
+    if dither_source == "sinusoid":
+        dither_rs, dither_cs = get_pure_dither_samples(dither, times)
+    else:
+        dither_rs, dither_cs = get_flight_att_dither_samples(ao, times)
 
     att_targ = ao.obs.att_targ
     stars = agasc.get_agasc_cone(att_targ.ra, att_targ.dec, 1.4)
@@ -626,3 +631,98 @@ def run_aki_from_sim_obs(obsid, duration=None):
         )
 
     return sdrs, crs_sim, ao
+
+
+def get_pure_dither_samples(dither, times):
+    """Compute sinusoidal dither offsets for row and column at specified times.
+
+    Converts dither parameters (periods, phases, amplitudes) to sinusoidal motion
+    offsets in pixel coordinates. The dither motion is used to move the tracked
+    image around the ACA detector during science observations.
+
+    Parameters
+    ----------
+    dither : dict-like
+        Dither motion parameters with fields ``yaw_period``, ``pitch_period``,
+        ``yaw_phase``, ``pitch_phase``, ``yaw_ampl``, and ``pitch_ampl``. Periods
+        are in seconds, phases in radians, and amplitudes in arcseconds.
+    times : np.ndarray
+        Time values (seconds) at which to compute dither offsets.
+
+    Returns
+    -------
+    dither_rs : np.ndarray
+        Dither offset in row (pixels) at each time, computed as sinusoidal motion
+        from yaw (pitch in spacecraft coordinates).
+    dither_cs : np.ndarray
+        Dither offset in column (pixels) at each time, computed as sinusoidal
+        motion from pitch (yaw in spacecraft coordinates).
+    """
+    period_r = dither.yaw_period
+    period_c = dither.pitch_period
+    phase_r = dither.yaw_phase
+    phase_c = dither.pitch_phase
+    ampl_r = dither.yaw_ampl / 5.0
+    ampl_c = dither.pitch_ampl / 5.0
+    omega_r = 2 * np.pi / period_r
+    omega_c = 2 * np.pi / period_c
+    dither_rs = ampl_r * np.sin(omega_r * times + phase_r)
+    dither_cs = ampl_c * np.sin(omega_c * times + phase_c)
+    return dither_rs, dither_cs
+
+
+def get_flight_att_dither_samples(ao, times):
+    """Compute dither offsets for row and column from flight attitude telemetry.
+
+    Takes the delta quaternion between the target attitude and the on-board
+    estimated attitude (``AOATTQT``) and converts the resulting pitch and yaw
+    offsets to pixel offsets, interpolated onto ``times``. Unlike
+    ``get_pure_dither_samples``, this captures the actual attitude motion
+    including dither, drift, and any attitude control residuals.
+
+    Parameters
+    ----------
+    ao : annie.sim_obs.AnnieObservation
+        Simulated observation, providing the target attitude
+        (``ao.obs.att_targ``), the attitude telemetry (``ao.obs.aoattqt``), and
+        the observation start time (``ao.obs.start``).
+    times : np.ndarray
+        Time values (seconds relative to ``ao.obs.start``) at which to compute
+        dither offsets. These must fall within the attitude telemetry coverage,
+        apart from an edge tolerance of one telemetry sample interval.
+
+    Returns
+    -------
+    dither_rs : np.ndarray
+        Dither offset in row (pixels) at each time, from the yaw offset.
+    dither_cs : np.ndarray
+        Dither offset in column (pixels) at each time, from the pitch offset.
+
+    Raises
+    ------
+    ValueError
+        If ``times`` extends beyond the attitude telemetry coverage by more than
+        one telemetry sample interval. Interpolation would otherwise silently
+        clip to the endpoint value, giving a constant (non-dithering) offset.
+    """
+    aoattqt = ao.obs.aoattqt
+    dq = ao.obs.att_targ.dq(aoattqt.vals)
+
+    # Telemetry times are CXC seconds while ``times`` is relative to obs start.
+    att_times = aoattqt.times - CxoTime(ao.obs.start).secs
+
+    # Telemetry does not exactly bracket the obs start/stop, so tolerate a gap of
+    # one sample interval at each end but reject anything genuinely uncovered.
+    tol = np.median(np.diff(att_times))
+    if times[0] < att_times[0] - tol or times[-1] > att_times[-1] + tol:
+        raise ValueError(
+            f"times [{times[0]:.1f}, {times[-1]:.1f}] extend beyond AOATTQT "
+            f"coverage [{att_times[0]:.1f}, {att_times[-1]:.1f}] "
+            f"(tolerance {tol:.1f} s) relative to obs start {ao.obs.start}"
+        )
+
+    # Convert degrees to arcsec and then to pixels. pitch <=> col, yaw <=> row.
+    dither_rs = np.interp(times, att_times, dq.yaw * 3600 / 5.0)
+    dither_cs = np.interp(times, att_times, dq.pitch * 3600 / 5.0)
+
+    return dither_rs, dither_cs
