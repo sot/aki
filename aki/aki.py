@@ -544,7 +544,9 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
     return out
 
 
-def run_aki_from_sim_obs(obsid, duration=None, dither_source="sinusoid"):
+def run_aki_from_sim_obs(
+    obsid, duration=None, dither_source="sinusoid", use_dyn_bgd_dark=False
+):
     """Run the guide star tracking simulation for a simulated observation (obsid).
 
     Builds a simulated observation via ``annie.sim_obs.AnnieObservation``, derives
@@ -565,6 +567,12 @@ def run_aki_from_sim_obs(obsid, duration=None, dither_source="sinusoid"):
         ideal sinusoidal dither from the commanded dither parameters, or
         ``"flight-att"`` to derive the dither from the flight attitude telemetry
         (``AOATTQT``) relative to the target attitude.
+    use_dyn_bgd_dark : bool, optional
+        If True, get the dark current image from
+        ``annie.sim_obs.get_dyn_bgd_flight_dark_current``, which updates the
+        nearest dark calibration using the 20th percentile of flight ACA image
+        samples in the mouse-bitten 8x8 edges. If False (default), use the
+        nearest dark calibration image directly.
 
     Returns
     -------
@@ -587,7 +595,14 @@ def run_aki_from_sim_obs(obsid, duration=None, dither_source="sinusoid"):
     ao = sim_obs.AnnieObservation(obsid, duration)
     duration = ao.duration
     dither = ao.obs.dither
-    dark = get_dark_cal_image(ao.obs.start, select="nearest", t_ccd_ref=ao.obs.t_ccd)
+    if use_dyn_bgd_dark:
+        dark = sim_obs.get_dyn_bgd_flight_dark_current(
+            ao.obs.start, ao.obs.stop, ao.obs.t_ccd
+        )
+    else:
+        dark = get_dark_cal_image(
+            ao.obs.start, select="nearest", t_ccd_ref=ao.obs.t_ccd
+        )
 
     dt = 2.05
     n_read = int(duration // dt)
