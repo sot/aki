@@ -372,8 +372,7 @@ def _advance_readout(
     guide_row = guide_row_cat + dither_r
     guide_col = guide_col_cat + dither_c
 
-    # bgd = calc_legacy_flight_bgd(np.asarray(img, dtype=np.float64))
-    bgd = 30.0
+    bgd = calc_legacy_flight_bgd(np.asarray(img, dtype=np.float64))
     # Centroid row/col relative to lower left pixel edge at 0, 0
     cent_row0, cent_col0, img_sum = centroid_fm(img, bgd)
     # Centroid row/col in absolute coordinates (with 0, 0 at the CCD center)
@@ -406,6 +405,7 @@ def _advance_readout(
         rate_col = 0.0
         img_row = guide_row
         img_col = guide_col
+        img_track = True
 
     return (
         cent_row,
@@ -593,7 +593,9 @@ def run_aki_from_sim_obs(
         )
 
     ao = sim_obs.AnnieObservation(obsid, duration)
-    duration = ao.duration
+    # ao.duration is the user-specified value and is None for a full-length obs,
+    # so take the resolved duration from the observation itself.
+    duration = ao.obs.duration_actual
     dither = ao.obs.dither
     if use_dyn_bgd_dark:
         dark = sim_obs.get_dyn_bgd_flight_dark_current(
