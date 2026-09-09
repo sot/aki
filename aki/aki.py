@@ -640,8 +640,12 @@ def run_aki_from_sim_obs(
 
     crs_sim = {}
     for slot, sdr in sdrs.items():
+        # Residuals are (observed - predicted) in yag/zag, matching the flight
+        # convention in chandra_aca.centroid_resid.CentroidResiduals. Note that row
+        # runs opposite to yag (d_row/d_yag = -0.2 pix/arcsec) while col runs with
+        # zag (d_col/d_zag = +0.2), so the row difference is negated.
         crs_sim[slot] = cent_app.CentroidResidualsLite(
-            dyags=(sdr["cent_row"] - sdr["star_row"]) * 5.0,
+            dyags=-(sdr["cent_row"] - sdr["star_row"]) * 5.0,
             dzags=(sdr["cent_col"] - sdr["star_col"]) * 5.0,
             yag_times=sdr["time"],
             zag_times=sdr["time"],
