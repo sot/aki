@@ -6,6 +6,8 @@ import numba
 import numpy as np
 from chandra_aca import transform
 from chandra_aca.aca_image import AcaPsfLibrary
+from cheta import fetch_eng
+from cheta.utils import logical_intervals
 from cxotime import CxoTime
 from mica.archive.aca_dark import get_dark_cal_image
 from ska_trend.centroid_dashboard import app as cent_app
@@ -168,7 +170,11 @@ def centroid_fm(img: np.ndarray, bgd_est: float | np.ndarray):
             cent_col_sum += jj * img_bgd_sub
 
     if norm < 10.0:
-        norm = 10.0
+        # Background over-subtraction (warm pixels in the legacy background pixels)
+        # can drive the sum negative, which makes the first moment meaningless. Keep
+        # the flux floor since callers compare it to the tracking threshold, but
+        # return the centroid as undefined instead of a garbage finite value.
+        return np.nan, np.nan, 10.0
 
     # Compute centroids and convert to "edge" pixel convention
     cent_row = cent_row_sum / norm + 0.5
@@ -689,6 +695,79 @@ def run_aki_from_sim_obs(
         }
 
     return sdrs, crs_sim, ao
+
+
+def _in_intervals(times, intervals):
+    """Boolean mask of ``times`` that fall within any of ``intervals``.
+
+    Parameters
+    ----------
+    times : np.ndarray
+        Times (CXC seconds).
+    intervals : astropy.table.Table
+        Table with ``tstart`` and ``tstop`` columns, e.g. from
+        ``cheta.utils.logical_intervals``.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask with the same length as ``times``.
+    """
+    ok = np.zeros(len(times), dtype=bool)
+    for interval in intervals:
+        ok |= (times >= interval["tstart"]) & (times <= interval["tstop"])
+    return ok
+
+
+def filter_crs_tracking(crs, slots=None):
+    """Filter flight centroid residuals to samples where the OBC was tracking.
+
+    The ``CentroidResidualsLite`` objects from
+    ``cent_app.get_centroid_resids_for_obsid`` include samples taken while the OBC
+    had lost the star (``AOACFCT`` of RACQ, SRCH or NONE). The centroid telemetry is
+    invalid there (``AOACYAN`` / ``AOACZAN`` are the -3276.8 bad-data sentinel), but
+    the residuals are still present and vary smoothly, so a plot of the unfiltered
+    residuals looks like good tracking where there was none.
+
+    Parameters
+    ----------
+    crs : dict
+        Per-slot dictionary of ``CentroidResidualsLite`` objects.
+    slots : list, optional
+        Slots to filter. Default is all slots in ``crs``.
+
+    Returns
+    -------
+    dict
+        Per-slot dictionary of ``CentroidResidualsLite`` objects with the
+        non-tracking samples removed.
+    """
+    if slots is None:
+        slots = list(crs)
+
+    crs_out = {}
+    for slot in slots:
+        cr = crs[slot]
+        times = np.concatenate([cr.yag_times, cr.zag_times])
+        if len(times) == 0:
+            crs_out[slot] = cr
+            continue
+
+        fct = fetch_eng.Msid(f"aoacfct{slot}", times.min() - 10, times.max() + 10)
+        intervals = logical_intervals(
+            fct.times, fct.vals == "TRAK", complete_intervals=False
+        )
+        ok_yag = _in_intervals(cr.yag_times, intervals)
+        ok_zag = _in_intervals(cr.zag_times, intervals)
+
+        crs_out[slot] = cent_app.CentroidResidualsLite(
+            dyags=cr.dyags[ok_yag],
+            dzags=cr.dzags[ok_zag],
+            yag_times=cr.yag_times[ok_yag],
+            zag_times=cr.zag_times[ok_zag],
+        )
+
+    return crs_out
 
 
 def get_pure_dither_samples(dither, times):
