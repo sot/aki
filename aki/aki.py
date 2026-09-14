@@ -396,6 +396,10 @@ def _advance_readout(
         or abs(guide_col - cent_col) > 1.0
     ):
         gs_loss_count += 1
+    else:
+        # PCAD clears the counter once the star is back within tolerance, so this
+        # counts consecutive bad readouts and not bad readouts over the whole obs.
+        gs_loss_count = 0
 
     # PCAD GS_loss_count threshold is 100 readouts at 1.025 s/readout. Here we
     # simulate only each 2.05 s image read.
@@ -474,8 +478,12 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
     # Below this threshold stop tracking
     min_img_sum = float(transform.mag_to_count_rate(guide["maxmag"])) / 2
 
-    img_row = guide_row_cat
-    img_col = guide_col_cat
+    # Start the window on the dithered star position, as flight does after
+    # acquisition. The dither at t=0 is generally non-zero (a couple of pixels for
+    # 16 arcsec dither), so starting at the undithered catalog position puts the
+    # star off-center from the first readout.
+    img_row = guide_row_cat + dither_rs[0]
+    img_col = guide_col_cat + dither_cs[0]
 
     # Initial rate
     rate_row = 0.0
