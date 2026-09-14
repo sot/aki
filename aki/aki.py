@@ -553,7 +553,12 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
 
 
 def run_aki_from_sim_obs(
-    obsid, duration=None, dither_source="sinusoid", use_dyn_bgd_dark=False
+    obsid,
+    *,
+    duration=None,
+    dither_source="sinusoid",
+    use_dyn_bgd_dark=False,
+    time_slice=None,
 ):
     """Run the guide star tracking simulation for a simulated observation (obsid).
 
@@ -581,6 +586,15 @@ def run_aki_from_sim_obs(
         nearest dark calibration using the 20th percentile of flight ACA image
         samples in the mouse-bitten 8x8 edges. If False (default), use the
         nearest dark calibration image directly.
+    time_slice : slice, optional
+        Slice to select a time range of the outputs, with the same semantics as
+        ``time_slice`` in ``cent_app.get_centroid_resids_for_obsid``. Float bounds
+        are seconds relative to the start of the simulation, or relative to the end
+        for negative values, e.g. ``slice(0.0, 1000.0)`` for the first 1000 seconds
+        and ``slice(-300.0, None)`` for the last 300 seconds. Integer bounds are a
+        plain sample index slice. Mutually exclusive with ``duration``. Note that
+        the full observation is always simulated and the slice is applied to the
+        outputs, so this does not reduce the run time.
 
     Returns
     -------
@@ -594,6 +608,9 @@ def run_aki_from_sim_obs(
         The simulated observation object.
     """
     from annie import sim_obs
+
+    if duration is not None and time_slice is not None:
+        raise ValueError("duration and time_slice are mutually exclusive")
 
     if dither_source not in ("sinusoid", "flight-att"):
         raise ValueError(
@@ -658,6 +675,18 @@ def run_aki_from_sim_obs(
             yag_times=sdr["time"],
             zag_times=sdr["time"],
         )
+
+    if time_slice is not None:
+        # Slice via CentroidResidualsLite to get the time-slice semantics for free,
+        # then keep sdrs in step using the times that survived.
+        crs_sim = {slot: cr[time_slice] for slot, cr in crs_sim.items()}
+        sdrs = {
+            slot: {
+                key: vals[np.isin(sdr["time"], crs_sim[slot].yag_times)]
+                for key, vals in sdr.items()
+            }
+            for slot, sdr in sdrs.items()
+        }
 
     return sdrs, crs_sim, ao
 
