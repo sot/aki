@@ -1,7 +1,6 @@
 import itertools
 
 import agasc
-import astropy.table as apt
 import numba
 import numpy as np
 from chandra_aca import transform
