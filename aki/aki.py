@@ -1,12 +1,15 @@
 import itertools
 
 import agasc
-import astropy.table as apt
 import numba
 import numpy as np
 from chandra_aca import transform
 from chandra_aca.aca_image import AcaPsfLibrary
+from cheta import fetch_eng
+from cheta.utils import logical_intervals
+from cxotime import CxoTime
 from mica.archive.aca_dark import get_dark_cal_image
+from ska_trend.centroid_dashboard import app as cent_app
 
 __all__ = ["calc_legacy_flight_bgd", "centroid_fm"]
 
@@ -166,7 +169,11 @@ def centroid_fm(img: np.ndarray, bgd_est: float | np.ndarray):
             cent_col_sum += jj * img_bgd_sub
 
     if norm < 10.0:
-        norm = 10.0
+        # Background over-subtraction (warm pixels in the legacy background pixels)
+        # can drive the sum negative, which makes the first moment meaningless. Keep
+        # the flux floor since callers compare it to the tracking threshold, but
+        # return the centroid as undefined instead of a garbage finite value.
+        return np.nan, np.nan, 10.0
 
     # Compute centroids and convert to "edge" pixel convention
     cent_row = cent_row_sum / norm + 0.5
@@ -177,7 +184,31 @@ def centroid_fm(img: np.ndarray, bgd_est: float | np.ndarray):
 
 @numba.njit()
 def get_psf_image_from_grid(row: float, col: float, norm: float, img: np.ndarray):
-    """Get PSF image from grid for given row/col and normalize."""
+    """Look up an 8x8 PSF image from ``PSF_IMGS_GRID`` for a given sub-pixel position.
+
+    The PSF grid is indexed by fractional row/col offset from the nearest integer
+    pixel (see ``make_psf_images``), so this splits ``row``/``col`` into an integer
+    part (the image lower-left corner offset) and a fractional part used to select
+    the nearest pre-computed PSF sample, which is then scaled by ``norm``.
+
+    Parameters
+    ----------
+    row : float
+        Star row position in pixel coordinates.
+    col : float
+        Star column position in pixel coordinates.
+    norm : float
+        Total flux to scale the PSF image by (e-/s).
+    img : np.ndarray
+        8x8 output array that is filled in-place with the scaled PSF image.
+
+    Returns
+    -------
+    row0 : int
+        Row offset of the image lower-left corner relative to ``row``.
+    col0 : int
+        Column offset of the image lower-left corner relative to ``col``.
+    """
     # Find the nearest integer row/col and the fractional part. Need to use floor and
     # not round because round goes up for e.g. 25.5 and down for 24.5.
     row_int = int(np.floor(row + 0.5))
@@ -195,6 +226,22 @@ def get_psf_image_from_grid(row: float, col: float, norm: float, img: np.ndarray
 
 @numba.njit()
 def clip(val: int, low: int, high: int):
+    """Clip ``val`` to the closed interval ``[low, high]``.
+
+    Parameters
+    ----------
+    val : int
+        Value to clip.
+    low : int
+        Lower bound.
+    high : int
+        Upper bound.
+
+    Returns
+    -------
+    int
+        ``val`` clamped to ``[low, high]``.
+    """
     if val < low:
         return low
     elif val > high:
@@ -213,6 +260,30 @@ def shine_star_image(
     star_norm: float,
     star_img: np.ndarray,
 ):
+    """Add a star's PSF image onto ``img`` in-place at the appropriate location.
+
+    Looks up the PSF for the star's position relative to the image's lower-left
+    corner (``img_row0``, ``img_col0``) via ``get_psf_image_from_grid``, then adds
+    the (possibly clipped, if it extends beyond the 8x8 ``img`` bounds) overlapping
+    portion of that PSF onto ``img``.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        8x8 image array to add the star's PSF onto, modified in-place.
+    img_row0 : int
+        Row of the lower-left corner of ``img`` in absolute pixel coordinates.
+    img_col0 : int
+        Column of the lower-left corner of ``img`` in absolute pixel coordinates.
+    star_row : float
+        Star row position in absolute pixel coordinates.
+    star_col : float
+        Star column position in absolute pixel coordinates.
+    star_norm : float
+        Total star flux (e-/s) used to scale the PSF image.
+    star_img : np.ndarray
+        8x8 scratch array used to hold the star's PSF image, overwritten in-place.
+    """
     star_row -= img_row0
     star_col -= img_col0
     star_row0, star_col0 = get_psf_image_from_grid(
@@ -227,108 +298,353 @@ def shine_star_image(
     ]
 
 
+@numba.njit()
+def _advance_readout(
+    dither_r,
+    dither_c,
+    guide_row_cat,
+    guide_col_cat,
+    star_row0s,
+    star_col0s,
+    star_norms,
+    star_img,
+    dark,
+    min_img_sum,
+    img_row,
+    img_col,
+    rate_row,
+    rate_col,
+    gs_loss_count,
+    img_track,
+):
+    """Advance guide-star tracking by one simulated readout.
+
+    Synthesizes the 8x8 readout image at the current tracked position, adds
+    nearby star PSFs, computes a first-moment centroid, and updates the
+    tracking rate and GS-loss state for the next readout.
+
+    Parameters
+    ----------
+    dither_r, dither_c : float
+        Dither offset (pixels) at this readout.
+    guide_row_cat, guide_col_cat : float
+        Guide star catalog position (pixels), before dither.
+    star_row0s, star_col0s, star_norms : np.ndarray
+        Catalog positions (pixels) and count rates (e-/s) of candidate stars
+        near the guide star.
+    star_img : np.ndarray
+        8x8 scratch array used to hold a star's PSF image.
+    dark : np.ndarray
+        Full dark current CCD image (e-/s) used as the image background.
+    min_img_sum : float
+        Image flux (e-/s) threshold below which tracking is dropped.
+    img_row, img_col, rate_row, rate_col, gs_loss_count, img_track
+        Tracking state carried over from the previous readout.
+
+    Returns
+    -------
+    cent_row, cent_col : float
+        Computed centroid in absolute pixel coordinates.
+    img_sum : float
+        Background-subtracted image flux (e-/s).
+    img_row0, img_col0 : int
+        Readout image lower-left corner in absolute pixel coordinates.
+    star_row, star_col : float
+        True (dithered) guide star position.
+    img_row, img_col, rate_row, rate_col, gs_loss_count, img_track
+        Updated tracking state for the next readout.
+    """
+    # Next image location center as floats
+    img_row = clip(img_row + rate_row, -508.0, 508.0)
+    img_col = clip(img_col + rate_col, -508.0, 508.0)
+
+    # Image readout lower left corner
+    img_row0 = int(round(img_row)) - 4
+    img_col0 = int(round(img_col)) - 4
+
+    img = dark[
+        img_row0 + 512 : img_row0 + 512 + 8, img_col0 + 512 : img_col0 + 512 + 8
+    ].copy()
+
+    # Shine star images onto img
+    for star_row0, star_col0, star_norm in zip(star_row0s, star_col0s, star_norms):
+        star_row = star_row0 + dither_r
+        star_col = star_col0 + dither_c
+        shine_star_image(
+            img, img_row0, img_col0, star_row, star_col, star_norm, star_img
+        )
+
+    guide_row = guide_row_cat + dither_r
+    guide_col = guide_col_cat + dither_c
+
+    bgd = calc_legacy_flight_bgd(np.asarray(img, dtype=np.float64))
+    # Centroid row/col relative to lower left pixel edge at 0, 0
+    cent_row0, cent_col0, img_sum = centroid_fm(img, bgd)
+    # Centroid row/col in absolute coordinates (with 0, 0 at the CCD center)
+    cent_row = cent_row0 + img_row0
+    cent_col = cent_col0 + img_col0
+
+    if img_sum < min_img_sum:
+        img_track = False
+
+    if not img_track:
+        # Corresponds to RACQ state with star below threshold and not tracking.
+        rate_row = 0.0
+        rate_col = 0.0
+    else:
+        rate_row = cent_row - img_row
+        rate_col = cent_col - img_col
+
+    if (
+        not img_track
+        or abs(guide_row - cent_row) > 1.0  # 1 pixel = 5 arcsec
+        or abs(guide_col - cent_col) > 1.0
+    ):
+        gs_loss_count += 1
+    else:
+        # PCAD clears the counter once the star is back within tolerance, so this
+        # counts consecutive bad readouts and not bad readouts over the whole obs.
+        gs_loss_count = 0
+
+    # PCAD GS_loss_count threshold is 100 readouts at 1.025 s/readout. Here we
+    # simulate only each 2.05 s image read.
+    if gs_loss_count > 50:
+        gs_loss_count = 0
+        rate_row = 0.0
+        rate_col = 0.0
+        img_row = guide_row
+        img_col = guide_col
+        img_track = True
+
+    return (
+        cent_row,
+        cent_col,
+        img_sum,
+        img_row0,
+        img_col0,
+        guide_row,
+        guide_col,
+        img_row,
+        img_col,
+        rate_row,
+        rate_col,
+        gs_loss_count,
+        img_track,
+    )
+
+
 def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
+    """Simulate ACA image-readout tracking of a single guide star over time.
+
+    For each dither offset in ``dither_rs``/``dither_cs``, this synthesizes an 8x8
+    ACA readout image (dark current plus PSF images of nearby stars from ``stars``),
+    computes a first-moment centroid, and updates the tracked image position for the
+    next readout using a simple rate-based tracking loop. Tracking is dropped if the
+    image sum falls below a minimum threshold or if the guide star loss counter (GS
+    loss) exceeds its limit, in which case tracking resets to the catalog position.
+
+    Parameters
+    ----------
+    guide : dict-like
+        Guide star catalog entry with fields ``row``, ``col``, ``maxmag``, and
+        ``slot``, in pixel coordinates (``pix_zero_loc='edge'``).
+    dither_rs : np.ndarray
+        Dither offset in row (pixels) at each simulated readout.
+    dither_cs : np.ndarray
+        Dither offset in column (pixels) at each simulated readout.
+    dark : np.ndarray
+        Full dark current CCD image (e-/s) used as the image background.
+    stars : dict-like / table
+        Candidate stars near the guide star, with fields ``row``, ``col``, ``mag``.
+
+    Returns
+    -------
+    dict
+        Dictionary of per-readout arrays with keys ``time``, ``star_row``,
+        ``star_col`` (true guide star position including dither), ``cent_row``,
+        ``cent_col`` (computed centroid), ``img_sum``, ``img_row0``, ``img_col0``
+        (readout image lower-left corner), and ``img_track`` (bool tracking state).
+    """
     # Find all stars with centroid within a 9-pixel halfw box of guide
     # Note pix_zero_loc = 'edge' for all these.
-    guide_row_cat = guide["row"]
-    guide_col_cat = guide["col"]
+    guide_row_cat = float(guide["row"])
+    guide_col_cat = float(guide["col"])
     ok = (np.abs(stars["row"] - guide_row_cat) < 9) & (
         np.abs(stars["col"] - guide_col_cat) < 9
     )
-    star_row0s = stars["row"][ok]
-    star_col0s = stars["col"][ok]
-    star_norms = transform.mag_to_count_rate(stars["mag"][ok])
+    star_row0s = np.asarray(stars["row"][ok], dtype=np.float64)
+    star_col0s = np.asarray(stars["col"][ok], dtype=np.float64)
+    star_norms = np.asarray(
+        transform.mag_to_count_rate(stars["mag"][ok]), dtype=np.float64
+    )
     # print(star_norms)
     star_img = np.empty((8, 8), dtype=float)
 
-    img_row = guide_row_cat
-    img_col = guide_col_cat
+    # Below this threshold stop tracking
+    min_img_sum = float(transform.mag_to_count_rate(guide["maxmag"])) / 2
+
+    # Start the window on the dithered star position, as flight does after
+    # acquisition. The dither at t=0 is generally non-zero (a couple of pixels for
+    # 16 arcsec dither), so starting at the undithered catalog position puts the
+    # star off-center from the first readout.
+    img_row = guide_row_cat + dither_rs[0]
+    img_col = guide_col_cat + dither_cs[0]
 
     # Initial rate
     rate_row = 0.0
     rate_col = 0.0
 
+    gs_loss_count = 0
+    img_track = True
+
     n_sim = len(dither_rs)
     cent_rows = np.zeros(n_sim, dtype=np.float64)
-    cent_cols = np.zeros_like(dither_rs, dtype=np.float64)
+    cent_cols = np.zeros(n_sim, dtype=np.float64)
     star_rows = np.zeros(n_sim, dtype=np.float64)
-    star_cols = np.zeros_like(dither_rs, dtype=np.float64)
-    norms = np.zeros_like(dither_rs, dtype=np.float64)
-    img_row0s = np.zeros_like(dither_rs, dtype=np.int32)
-    img_col0s = np.zeros_like(dither_rs, dtype=np.int32)
+    star_cols = np.zeros(n_sim, dtype=np.float64)
+    img_sums = np.zeros(n_sim, dtype=np.float64)
+    img_row0s = np.zeros(n_sim, dtype=np.int32)
+    img_col0s = np.zeros(n_sim, dtype=np.int32)
+    img_tracks = np.zeros(n_sim, dtype=bool)
 
     for idx, dither_r, dither_c in zip(itertools.count(), dither_rs, dither_cs):
-        # Next image location center as floats
-        img_row = clip(img_row + rate_row, -508.0, 508.0)
-        img_col = clip(img_col + rate_col, -508.0, 508.0)
-
-        # Image readout lower left corner
-        img_row0 = int(round(img_row)) - 4
-        img_col0 = int(round(img_col)) - 4
-        img_row0s[idx] = img_row0
-        img_col0s[idx] = img_col0
-
-        img = dark[
-            img_row0 + 512 : img_row0 + 512 + 8, img_col0 + 512 : img_col0 + 512 + 8
-        ].copy()
-
-        # Shine star images onto img
-        for star_row0, star_col0, star_norm in zip(star_row0s, star_col0s, star_norms):
-            star_row = star_row0 + dither_r
-            star_col = star_col0 + dither_c
-            shine_star_image(
-                img, img_row0, img_col0, star_row, star_col, star_norm, star_img
-            )
-
-        star_rows[idx] = guide_row_cat + dither_r
-        star_cols[idx] = guide_col_cat + dither_c
-
-        # bgd = calc_legacy_flight_bgd(np.asarray(img, dtype=np.float64))
-        bgd = 30.0
-        cent_row0, cent_col0, cent_norm = centroid_fm(img, bgd)
-        cent_rows[idx] = cent_row0 + img_row0
-        cent_cols[idx] = cent_col0 + img_col0
-        norms[idx] = cent_norm
-
-        rate_row = cent_rows[idx] - img_row
-        rate_col = cent_cols[idx] - img_col
+        (
+            cent_rows[idx],
+            cent_cols[idx],
+            img_sums[idx],
+            img_row0s[idx],
+            img_col0s[idx],
+            star_rows[idx],
+            star_cols[idx],
+            img_row,
+            img_col,
+            rate_row,
+            rate_col,
+            gs_loss_count,
+            img_track,
+        ) = _advance_readout(
+            dither_r,
+            dither_c,
+            guide_row_cat,
+            guide_col_cat,
+            star_row0s,
+            star_col0s,
+            star_norms,
+            star_img,
+            dark,
+            min_img_sum,
+            img_row,
+            img_col,
+            rate_row,
+            rate_col,
+            gs_loss_count,
+            img_track,
+        )
+        img_tracks[idx] = img_track
 
     out = {
+        "time": np.arange(n_sim) * 2.05,
         "star_row": star_rows,
         "star_col": star_cols,
         "cent_row": cent_rows,
         "cent_col": cent_cols,
-        "norm": norms,
+        "img_sum": img_sums,
         "img_row0": img_row0s,
         "img_col0": img_col0s,
+        "img_track": img_tracks,
     }
 
-    return apt.Table(out)
+    return out
 
 
-def run_aki_from_sim_obs(obsid, duration=None):
+def run_aki_from_sim_obs(
+    obsid,
+    *,
+    duration=None,
+    dither_source="sinusoid",
+    use_dyn_bgd_dark=False,
+    time_slice=None,
+):
+    """Run the guide star tracking simulation for a simulated observation (obsid).
+
+    Builds a simulated observation via ``annie.sim_obs.AnnieObservation``, derives
+    the dither motion, dark current image, and candidate/guide star catalogs for
+    that observation, then runs ``star_track_numba`` for each guide star and wraps
+    the results in ``CentroidResidualsLite`` objects for comparison against the
+    true (dithered) star positions.
+
+    Parameters
+    ----------
+    obsid : int
+        Observation ID to simulate.
+    duration : float, optional
+        Observation duration in seconds. If not given, uses the full duration from
+        the simulated observation.
+    dither_source : str, optional
+        Source of the dither motion, either ``"sinusoid"`` (default) to generate
+        ideal sinusoidal dither from the commanded dither parameters, or
+        ``"flight-att"`` to derive the dither from the flight attitude telemetry
+        (``AOATTQT``) relative to the target attitude.
+    use_dyn_bgd_dark : bool, optional
+        If True, get the dark current image from
+        ``annie.sim_obs.get_dyn_bgd_flight_dark_current``, which updates the
+        nearest dark calibration using the 20th percentile of flight ACA image
+        samples in the mouse-bitten 8x8 edges. If False (default), use the
+        nearest dark calibration image directly.
+    time_slice : slice, optional
+        Slice to select a time range of the outputs, with the same semantics as
+        ``time_slice`` in ``cent_app.get_centroid_resids_for_obsid``. Float bounds
+        are seconds relative to the start of the simulation, or relative to the end
+        for negative values, e.g. ``slice(0.0, 1000.0)`` for the first 1000 seconds
+        and ``slice(-300.0, None)`` for the last 300 seconds. Integer bounds are a
+        plain sample index slice. Mutually exclusive with ``duration``. Note that
+        the full observation is always simulated and the slice is applied to the
+        outputs, so this does not reduce the run time.
+
+    Returns
+    -------
+    sdrs : dict
+        Per-slot dictionary of simulated tracking results, keyed by guide star slot
+        (see ``star_track_numba`` return value for the per-slot dict contents).
+    crs_sim : dict
+        Per-slot dictionary of ``CentroidResidualsLite`` objects built from the
+        centroid residuals (dyag/dzag) in ``sdrs``.
+    ao : annie.sim_obs.AnnieObservation
+        The simulated observation object.
+    """
     from annie import sim_obs
 
+    if duration is not None and time_slice is not None:
+        raise ValueError("duration and time_slice are mutually exclusive")
+
+    if dither_source not in ("sinusoid", "flight-att"):
+        raise ValueError(
+            f"dither_source must be 'sinusoid' or 'flight-att', not {dither_source!r}"
+        )
+
     ao = sim_obs.AnnieObservation(obsid, duration)
-    duration = ao.duration
+    # ao.duration is the user-specified value and is None for a full-length obs,
+    # so take the resolved duration from the observation itself.
+    duration = ao.obs.duration_actual
     dither = ao.obs.dither
-    dark = get_dark_cal_image(ao.obs.start, select="nearest", t_ccd_ref=ao.obs.t_ccd)
+    if use_dyn_bgd_dark:
+        dark = sim_obs.get_dyn_bgd_flight_dark_current(
+            ao.obs.start, ao.obs.stop, ao.obs.t_ccd
+        )
+    else:
+        dark = get_dark_cal_image(
+            ao.obs.start, select="nearest", t_ccd_ref=ao.obs.t_ccd
+        )
 
     dt = 2.05
     n_read = int(duration // dt)
     times = np.arange(n_read) * dt
 
     # pitch <=> col, yaw <=> row
-    period_r = dither.yaw_period
-    period_c = dither.pitch_period
-    phase_r = dither.yaw_phase
-    phase_c = dither.pitch_phase
-    ampl_r = dither.yaw_ampl / 5.0
-    ampl_c = dither.pitch_ampl / 5.0
-    omega_r = 2 * np.pi / period_r
-    omega_c = 2 * np.pi / period_c
-    dither_rs = ampl_r * np.sin(omega_r * times + phase_r)
-    dither_cs = ampl_c * np.sin(omega_c * times + phase_c)
+    if dither_source == "sinusoid":
+        dither_rs, dither_cs = get_pure_dither_samples(dither, times)
+    else:
+        dither_rs, dither_cs = get_flight_att_dither_samples(ao, times)
 
     att_targ = ao.obs.att_targ
     stars = agasc.get_agasc_cone(att_targ.ra, att_targ.dec, 1.4)
@@ -352,4 +668,197 @@ def run_aki_from_sim_obs(obsid, duration=None):
         sdr = star_track_numba(guide, dither_rs, dither_cs, dark=dark, stars=stars)
         sdrs[guide["slot"]] = sdr
 
-    return sdrs, ao
+    crs_sim = {}
+    for slot, sdr in sdrs.items():
+        # Residuals are (observed - predicted) in yag/zag, matching the flight
+        # convention in chandra_aca.centroid_resid.CentroidResiduals. Note that row
+        # runs opposite to yag (d_row/d_yag = -0.2 pix/arcsec) while col runs with
+        # zag (d_col/d_zag = +0.2), so the row difference is negated.
+        crs_sim[slot] = cent_app.CentroidResidualsLite(
+            dyags=-(sdr["cent_row"] - sdr["star_row"]) * 5.0,
+            dzags=(sdr["cent_col"] - sdr["star_col"]) * 5.0,
+            yag_times=sdr["time"],
+            zag_times=sdr["time"],
+        )
+
+    if time_slice is not None:
+        # Slice via CentroidResidualsLite to get the time-slice semantics for free,
+        # then keep sdrs in step using the times that survived.
+        crs_sim = {slot: cr[time_slice] for slot, cr in crs_sim.items()}
+        sdrs = {
+            slot: {
+                key: vals[np.isin(sdr["time"], crs_sim[slot].yag_times)]
+                for key, vals in sdr.items()
+            }
+            for slot, sdr in sdrs.items()
+        }
+
+    return sdrs, crs_sim, ao
+
+
+def _in_intervals(times, intervals):
+    """Boolean mask of ``times`` that fall within any of ``intervals``.
+
+    Parameters
+    ----------
+    times : np.ndarray
+        Times (CXC seconds).
+    intervals : astropy.table.Table
+        Table with ``tstart`` and ``tstop`` columns, e.g. from
+        ``cheta.utils.logical_intervals``.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask with the same length as ``times``.
+    """
+    ok = np.zeros(len(times), dtype=bool)
+    for interval in intervals:
+        ok |= (times >= interval["tstart"]) & (times <= interval["tstop"])
+    return ok
+
+
+def filter_crs_tracking(crs, slots=None):
+    """Filter flight centroid residuals to samples where the OBC was tracking.
+
+    The ``CentroidResidualsLite`` objects from
+    ``cent_app.get_centroid_resids_for_obsid`` include samples taken while the OBC
+    had lost the star (``AOACFCT`` of RACQ, SRCH or NONE). The centroid telemetry is
+    invalid there (``AOACYAN`` / ``AOACZAN`` are the -3276.8 bad-data sentinel), but
+    the residuals are still present and vary smoothly, so a plot of the unfiltered
+    residuals looks like good tracking where there was none.
+
+    Parameters
+    ----------
+    crs : dict
+        Per-slot dictionary of ``CentroidResidualsLite`` objects.
+    slots : list, optional
+        Slots to filter. Default is all slots in ``crs``.
+
+    Returns
+    -------
+    dict
+        Per-slot dictionary of ``CentroidResidualsLite`` objects with the
+        non-tracking samples removed.
+    """
+    if slots is None:
+        slots = list(crs)
+
+    crs_out = {}
+    for slot in slots:
+        cr = crs[slot]
+        times = np.concatenate([cr.yag_times, cr.zag_times])
+        if len(times) == 0:
+            crs_out[slot] = cr
+            continue
+
+        fct = fetch_eng.Msid(f"aoacfct{slot}", times.min() - 10, times.max() + 10)
+        intervals = logical_intervals(
+            fct.times, fct.vals == "TRAK", complete_intervals=False
+        )
+        ok_yag = _in_intervals(cr.yag_times, intervals)
+        ok_zag = _in_intervals(cr.zag_times, intervals)
+
+        crs_out[slot] = cent_app.CentroidResidualsLite(
+            dyags=cr.dyags[ok_yag],
+            dzags=cr.dzags[ok_zag],
+            yag_times=cr.yag_times[ok_yag],
+            zag_times=cr.zag_times[ok_zag],
+        )
+
+    return crs_out
+
+
+def get_pure_dither_samples(dither, times):
+    """Compute sinusoidal dither offsets for row and column at specified times.
+
+    Converts dither parameters (periods, phases, amplitudes) to sinusoidal motion
+    offsets in pixel coordinates. The dither motion is used to move the tracked
+    image around the ACA detector during science observations.
+
+    Parameters
+    ----------
+    dither : dict-like
+        Dither motion parameters with fields ``yaw_period``, ``pitch_period``,
+        ``yaw_phase``, ``pitch_phase``, ``yaw_ampl``, and ``pitch_ampl``. Periods
+        are in seconds, phases in radians, and amplitudes in arcseconds.
+    times : np.ndarray
+        Time values (seconds) at which to compute dither offsets.
+
+    Returns
+    -------
+    dither_rs : np.ndarray
+        Dither offset in row (pixels) at each time, computed as sinusoidal motion
+        from yaw (pitch in spacecraft coordinates).
+    dither_cs : np.ndarray
+        Dither offset in column (pixels) at each time, computed as sinusoidal
+        motion from pitch (yaw in spacecraft coordinates).
+    """
+    period_r = dither.yaw_period
+    period_c = dither.pitch_period
+    phase_r = dither.yaw_phase
+    phase_c = dither.pitch_phase
+    ampl_r = dither.yaw_ampl / 5.0
+    ampl_c = dither.pitch_ampl / 5.0
+    omega_r = 2 * np.pi / period_r
+    omega_c = 2 * np.pi / period_c
+    dither_rs = ampl_r * np.sin(omega_r * times + phase_r)
+    dither_cs = ampl_c * np.sin(omega_c * times + phase_c)
+    return dither_rs, dither_cs
+
+
+def get_flight_att_dither_samples(ao, times):
+    """Compute dither offsets for row and column from flight attitude telemetry.
+
+    Takes the delta quaternion between the target attitude and the on-board
+    estimated attitude (``AOATTQT``) and converts the resulting pitch and yaw
+    offsets to pixel offsets, interpolated onto ``times``. Unlike
+    ``get_pure_dither_samples``, this captures the actual attitude motion
+    including dither, drift, and any attitude control residuals.
+
+    Parameters
+    ----------
+    ao : annie.sim_obs.AnnieObservation
+        Simulated observation, providing the target attitude
+        (``ao.obs.att_targ``), the attitude telemetry (``ao.obs.aoattqt``), and
+        the observation start time (``ao.obs.start``).
+    times : np.ndarray
+        Time values (seconds relative to ``ao.obs.start``) at which to compute
+        dither offsets. These must fall within the attitude telemetry coverage,
+        apart from an edge tolerance of one telemetry sample interval.
+
+    Returns
+    -------
+    dither_rs : np.ndarray
+        Dither offset in row (pixels) at each time, from the yaw offset.
+    dither_cs : np.ndarray
+        Dither offset in column (pixels) at each time, from the pitch offset.
+
+    Raises
+    ------
+    ValueError
+        If ``times`` extends beyond the attitude telemetry coverage by more than
+        one telemetry sample interval. Interpolation would otherwise silently
+        clip to the endpoint value, giving a constant (non-dithering) offset.
+    """
+    aoattqt = ao.obs.aoattqt
+    dq = ao.obs.att_targ.dq(aoattqt.vals)
+
+    # Telemetry times are CXC seconds while ``times`` is relative to obs start.
+    att_times = aoattqt.times - CxoTime(ao.obs.start).secs
+
+    # Telemetry does not exactly bracket the obs start/stop, so tolerate a gap of
+    # one sample interval at each end but reject anything genuinely uncovered.
+    tol = np.median(np.diff(att_times))
+    if times[0] < att_times[0] - tol or times[-1] > att_times[-1] + tol:
+        raise ValueError(
+            f"times [{times[0]:.1f}, {times[-1]:.1f}] extend beyond AOATTQT "
+            f"coverage [{att_times[0]:.1f}, {att_times[-1]:.1f}] "
+            f"(tolerance {tol:.1f} s) relative to obs start {ao.obs.start}"
+        )
+
+    # Convert degrees to arcsec and then to pixels. pitch <=> col, yaw <=> row.
+    dither_rs = np.interp(times, att_times, dq.yaw * 3600 / 5.0)
+    dither_cs = np.interp(times, att_times, dq.pitch * 3600 / 5.0)
+
+    return dither_rs, dither_cs
