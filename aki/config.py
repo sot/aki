@@ -4,9 +4,9 @@ A simulation is described by a ``SimConfig`` made of one small frozen dataclass 
 concern:
 
 - ``dither``: how the star moves on the CCD (``SinusoidDither``).
-- ``dark``: the true dark current on the CCD (``StaticDark``).
+- ``dark``: the true dark current on the CCD (``DarkStatic``).
 - ``bgd``: the background estimate the PEA subtracts before centroiding
-  (``LegacyBgd`` or ``ImageBgd``).
+  (``BgdLegacy`` or ``BgdStatic``).
 
 The class chooses the behavior, and each class holds only the options that apply to
 it. This replaces annie-style ``*_source`` / ``*_data`` keyword pairs. Configs never
@@ -15,18 +15,17 @@ that ``aki.simulate`` passes to the tracking kernel.
 
 Example::
 
-    >>> from aki import SimConfig, SinusoidDither, StaticDark, simulate
+    >>> from aki import SimConfig, SinusoidDither, DarkStatic, simulate
     >>> cfg = SimConfig(
     ...     duration=5000.0,
     ...     dither=SinusoidDither(yaw_ampl=16, pitch_ampl=16),
-    ...     dark=StaticDark.from_pixels({(0, 0): 1000.0}),
+    ...     dark=DarkStatic.from_pixels({(0, 0): 1000.0}),
     ... )
-    >>> out = simulate(guide, stars, cfg)
 
 Use ``dataclasses.replace`` to vary one option::
 
     >>> from dataclasses import replace
-    >>> cfg_known = replace(cfg, bgd=ImageBgd(image=cfg.dark.image))
+    >>> cfg_known = replace(cfg, bgd=BgdStatic(image=cfg.dark.image))
 """
 
 from dataclasses import dataclass, field
@@ -37,11 +36,11 @@ __all__ = [
     "BGD_MODE_IMAGE",
     "BGD_MODE_LEGACY",
     "CCD_SHAPE",
-    "ImageBgd",
-    "LegacyBgd",
+    "BgdLegacy",
+    "BgdStatic",
+    "DarkStatic",
     "SimConfig",
     "SinusoidDither",
-    "StaticDark",
 ]
 
 # Full-CCD images are indexed [row + 512, col + 512] where (row, col) is the integer
@@ -104,7 +103,7 @@ class SinusoidDither:
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
-class StaticDark:
+class DarkStatic:
     """True dark current that does not change with time.
 
     Parameters
@@ -120,10 +119,10 @@ class StaticDark:
         object.__setattr__(self, "image", _as_readonly_ccd_image(self.image, "image"))
 
     def __repr__(self):
-        return f"StaticDark(image={_ccd_image_repr(self.image)})"
+        return f"DarkStatic(image={_ccd_image_repr(self.image)})"
 
     @classmethod
-    def from_pixels(cls, pixels: dict, background: float = 0.0) -> "StaticDark":
+    def from_pixels(cls, pixels: dict, background: float = 0.0) -> "DarkStatic":
         """Uniform dark current ``background`` with some pixels set.
 
         Parameters
@@ -143,7 +142,7 @@ class StaticDark:
 
 
 @dataclass(frozen=True, kw_only=True)
-class LegacyBgd:
+class BgdLegacy:
     """Legacy flight background: one value per readout from the 8 corner pixels.
 
     See ``aki.calc_legacy_flight_bgd``.
@@ -155,7 +154,7 @@ class LegacyBgd:
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
-class ImageBgd:
+class BgdStatic:
     """Fixed per-pixel background image subtracted from every readout.
 
     With ``image`` equal to the true dark current this is a perfectly known
@@ -175,13 +174,13 @@ class ImageBgd:
         object.__setattr__(self, "image", _as_readonly_ccd_image(self.image, "image"))
 
     def __repr__(self):
-        return f"ImageBgd(image={_ccd_image_repr(self.image)})"
+        return f"BgdStatic(image={_ccd_image_repr(self.image)})"
 
     @classmethod
-    def from_pixels(cls, pixels: dict, background: float = 0.0) -> "ImageBgd":
+    def from_pixels(cls, pixels: dict, background: float = 0.0) -> "BgdStatic":
         """Uniform background ``background`` with some pixels set.
 
-        See ``StaticDark.from_pixels``.
+        See ``DarkStatic.from_pixels``.
         """
         return cls(image=_ccd_image_from_pixels(pixels, background))
 
@@ -196,21 +195,21 @@ class SimConfig:
 
     Parameters
     ----------
-    dark : StaticDark
+    dark : DarkStatic
         True dark current on the CCD. Required.
     duration : float
         Simulated time (seconds). Readouts are every ``aki.DT_READOUT`` seconds
         for times in ``[0, duration)``.
     dither : SinusoidDither
         Dither pattern.
-    bgd : LegacyBgd or ImageBgd
+    bgd : BgdLegacy or BgdStatic
         Background estimate subtracted before centroiding.
     """
 
-    dark: StaticDark
+    dark: DarkStatic
     duration: float = 1000.0
     dither: SinusoidDither = field(default_factory=SinusoidDither)
-    bgd: LegacyBgd | ImageBgd = field(default_factory=LegacyBgd)
+    bgd: BgdLegacy | BgdStatic = field(default_factory=BgdLegacy)
 
     def __post_init__(self):
         if self.duration <= 0:

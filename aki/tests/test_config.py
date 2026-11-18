@@ -6,11 +6,11 @@ from chandra_aca.transform import count_rate_to_mag
 
 from aki import (
     BGD_MODE_IMAGE,
-    ImageBgd,
-    LegacyBgd,
+    BgdLegacy,
+    BgdStatic,
+    DarkStatic,
     SimConfig,
     SinusoidDither,
-    StaticDark,
     simulate,
 )
 from aki.aki import get_pure_dither_samples, star_track_numba
@@ -32,13 +32,13 @@ def hot_pixel_config(**kwargs):
     return SimConfig(
         duration=5000.0,
         dither=DITHER,
-        dark=StaticDark.from_pixels({(0, 0): 1000.0}),
+        dark=DarkStatic.from_pixels({(0, 0): 1000.0}),
         **kwargs,
     )
 
 
 def test_simulate_legacy_matches_star_track_numba():
-    """simulate() with LegacyBgd reproduces calling the kernel directly."""
+    """simulate() with BgdLegacy reproduces calling the kernel directly."""
     cfg = hot_pixel_config()
     out = simulate(GUIDE, STARS, cfg)
 
@@ -61,11 +61,11 @@ def test_simulate_legacy_matches_star_track_numba():
 def test_image_bgd_removes_known_hot_pixel():
     """Subtracting the exact dark current makes the hot pixel invisible."""
     cfg_hot = hot_pixel_config()
-    cfg_hot = replace(cfg_hot, bgd=ImageBgd(image=cfg_hot.dark.image))
+    cfg_hot = replace(cfg_hot, bgd=BgdStatic(image=cfg_hot.dark.image))
     cfg_zero = replace(
         cfg_hot,
-        dark=StaticDark.from_pixels({}),
-        bgd=ImageBgd.from_pixels({}),
+        dark=DarkStatic.from_pixels({}),
+        bgd=BgdStatic.from_pixels({}),
     )
     out_hot = simulate(GUIDE, STARS, cfg_hot)
     out_zero = simulate(GUIDE, STARS, cfg_zero)
@@ -79,14 +79,14 @@ def test_image_bgd_removes_known_hot_pixel():
 
 def test_image_bgd_too_low_offsets_centroid():
     """A background 1000 e-/s too low for the hot pixel offsets the centroid."""
-    cfg = hot_pixel_config(bgd=ImageBgd.from_pixels({}))
+    cfg = hot_pixel_config(bgd=BgdStatic.from_pixels({}))
     out = simulate(GUIDE, STARS, cfg)
     dy = (out["cent_row"] - out["star_row"]) * 5
     assert np.max(np.abs(dy)) > 1.0
 
 
 def test_static_dark_from_pixels_and_readonly():
-    dark = StaticDark.from_pixels({(0, 0): 1000.0, (-3, 5): 50.0}, background=2.0)
+    dark = DarkStatic.from_pixels({(0, 0): 1000.0, (-3, 5): 50.0}, background=2.0)
     assert dark.image[512, 512] == 1000.0
     assert dark.image[509, 517] == 50.0
     assert dark.image[0, 0] == 2.0
@@ -99,31 +99,31 @@ def test_static_dark_from_pixels_and_readonly():
 
 def test_static_dark_copies_input():
     image = np.zeros((1024, 1024))
-    dark = StaticDark(image=image)
+    dark = DarkStatic(image=image)
     image[0, 0] = 99.0
     assert dark.image[0, 0] == 0.0
 
 
-@pytest.mark.parametrize("cls", [StaticDark, ImageBgd])
+@pytest.mark.parametrize("cls", [DarkStatic, BgdStatic])
 def test_bad_image_shape(cls):
     with pytest.raises(ValueError, match="shape"):
         cls(image=np.zeros((8, 8)))
 
 
 def test_bgd_prepare():
-    mode, img = ImageBgd.from_pixels({(0, 0): 5.0}).prepare()
+    mode, img = BgdStatic.from_pixels({(0, 0): 5.0}).prepare()
     assert mode == BGD_MODE_IMAGE
     assert img[512, 512] == 5.0
-    assert LegacyBgd().prepare()[1].shape == (0, 0)
+    assert BgdLegacy().prepare()[1].shape == (0, 0)
 
 
 def test_config_validation():
     with pytest.raises(ValueError):
-        SimConfig(dark=StaticDark.from_pixels({}), duration=0)
+        SimConfig(dark=DarkStatic.from_pixels({}), duration=0)
     with pytest.raises(ValueError):
         SinusoidDither(yaw_period=0)
     with pytest.raises(TypeError):
-        SimConfig(StaticDark.from_pixels({}))  # keyword-only
+        SimConfig(DarkStatic.from_pixels({}))  # keyword-only
 
 
 def test_star_track_numba_image_mode_requires_bgd_img():
