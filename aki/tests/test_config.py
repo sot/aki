@@ -137,9 +137,30 @@ def test_scalar_fields_cast_to_float():
         SinusoidDither(yaw_ampl=np.array([1.0, 2.0]))
 
 
-def test_star_track_numba_image_mode_requires_bgd_img():
+def test_star_track_numba_bgd_validation():
     dark = np.zeros((1024, 1024))
-    with pytest.raises(ValueError, match="bgd_img"):
+    with pytest.raises(TypeError, match="bgd must be"):
+        star_track_numba(GUIDE, np.zeros(3), np.zeros(3), dark, STARS, bgd=dark)
+    with pytest.raises(ValueError, match="same shape as dark"):
         star_track_numba(
-            GUIDE, np.zeros(3), np.zeros(3), dark, STARS, bgd_mode=BGD_MODE_IMAGE
+            GUIDE,
+            np.zeros(3),
+            np.zeros(3),
+            np.zeros((10, 10)),
+            STARS,
+            bgd=BgdStatic.from_pixels({}),
         )
+
+
+def test_star_track_numba_bgd_static_matches_simulate():
+    cfg = hot_pixel_config(bgd=BgdStatic.from_pixels({(0, 0): 1000.0}))
+    out = simulate(GUIDE, STARS, cfg)
+    exp = star_track_numba(
+        GUIDE,
+        *get_pure_dither_samples(DITHER, out["time"]),
+        cfg.dark.get_image(),
+        STARS,
+        bgd=cfg.bgd,
+    )
+    for key in OUT_KEYS:
+        np.testing.assert_array_equal(out[key], exp[key])

@@ -12,7 +12,7 @@ from cxotime import CxoTime
 from mica.archive.aca_dark import get_dark_cal_image
 from ska_trend.centroid_dashboard import app as cent_app
 
-from aki.config import BGD_MODE_IMAGE, BGD_MODE_LEGACY
+from aki.config import BGD_MODE_IMAGE, BGD_MODE_LEGACY, BgdLegacy, BgdStatic
 
 if TYPE_CHECKING:
     from aki.config import SimConfig
@@ -467,8 +467,7 @@ def star_track_numba(
     dark: np.ndarray,
     stars,
     *,
-    bgd_mode: int = BGD_MODE_LEGACY,
-    bgd_img: np.ndarray | None = None,
+    bgd: BgdLegacy | BgdStatic | None = None,
 ):
     """Simulate ACA image-readout tracking of a single guide star over time.
 
@@ -492,11 +491,9 @@ def star_track_numba(
         Full dark current CCD image (e-/s) used as the image background.
     stars : dict-like / table
         Candidate stars near the guide star, with fields ``row``, ``col``, ``mag``.
-    bgd_mode : int, optional
-        Background estimate subtracted before centroiding, ``BGD_MODE_LEGACY``
-        (default) or ``BGD_MODE_IMAGE``.
-    bgd_img : np.ndarray, optional
-        Full-CCD background estimate image (e-/s), required for ``BGD_MODE_IMAGE``.
+    bgd : BgdLegacy or BgdStatic, optional
+        Background estimate subtracted before centroiding. Default is
+        ``BgdLegacy()`` (legacy flight algorithm).
 
     Returns
     -------
@@ -521,16 +518,13 @@ def star_track_numba(
     # print(star_norms)
     star_img = np.empty((8, 8), dtype=float)
 
-    if bgd_mode == BGD_MODE_IMAGE:
-        if bgd_img is None or bgd_img.shape != dark.shape:
-            raise ValueError(
-                "BGD_MODE_IMAGE requires bgd_img with the same shape as dark"
-            )
-    elif bgd_mode != BGD_MODE_LEGACY:
-        raise ValueError(f"unknown bgd_mode {bgd_mode!r}")
-    if bgd_img is None:
-        bgd_img = np.zeros((0, 0), dtype=np.float64)
-    bgd_img = np.asarray(bgd_img, dtype=np.float64)
+    if bgd is None:
+        bgd = BgdLegacy()
+    if not isinstance(bgd, (BgdLegacy, BgdStatic)):
+        raise TypeError(f"bgd must be BgdLegacy or BgdStatic, got {type(bgd).__name__}")
+    bgd_mode, bgd_img = bgd.prepare()
+    if bgd_mode == BGD_MODE_IMAGE and bgd_img.shape != dark.shape:
+        raise ValueError("bgd image must have the same shape as dark")
 
     # Below this threshold stop tracking
     min_img_sum = float(transform.mag_to_count_rate(guide["maxmag"])) / 2
@@ -632,15 +626,13 @@ def simulate(guide, stars, cfg: "SimConfig"):
     """
     times = np.arange(0.0, cfg.duration, DT_READOUT)
     dither_rs, dither_cs = cfg.dither.get_offsets(times)
-    bgd_mode, bgd_img = cfg.bgd.prepare()
     out = star_track_numba(
         guide,
         dither_rs,
         dither_cs,
         cfg.dark.get_image(),
         stars,
-        bgd_mode=bgd_mode,
-        bgd_img=bgd_img,
+        bgd=cfg.bgd,
     )
     out["config"] = cfg
     return out
