@@ -126,6 +126,17 @@ def test_config_validation():
         SimConfig(DarkStatic.from_pixels({}))  # keyword-only
 
 
+def test_scalar_fields_cast_to_float():
+    dither = SinusoidDither(yaw_ampl=16, pitch_period=np.float64(500.0))
+    assert type(dither.yaw_ampl) is float
+    assert type(dither.pitch_period) is float
+    assert "np.float64" not in repr(dither)
+    cfg = SimConfig(dark=DarkStatic.from_pixels({}), duration=np.int64(100))
+    assert type(cfg.duration) is float
+    with pytest.raises(TypeError):
+        SinusoidDither(yaw_ampl=np.array([1.0, 2.0]))
+
+
 def test_star_track_numba_image_mode_requires_bgd_img():
     dark = np.zeros((1024, 1024))
     with pytest.raises(ValueError, match="bgd_img"):

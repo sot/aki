@@ -28,7 +28,7 @@ Use ``dataclasses.replace`` to vary one option::
     >>> cfg_known = replace(cfg, bgd=BgdStatic(image=cfg.dark.image))
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 import numpy as np
 
@@ -92,6 +92,8 @@ class SinusoidDither:
     pitch_phase: float = 0.0
 
     def __post_init__(self):
+        for fld in fields(self):
+            object.__setattr__(self, fld.name, float(getattr(self, fld.name)))
         if self.yaw_period <= 0 or self.pitch_period <= 0:
             raise ValueError("dither periods must be positive")
 
@@ -212,5 +214,6 @@ class SimConfig:
     bgd: BgdLegacy | BgdStatic = field(default_factory=BgdLegacy)
 
     def __post_init__(self):
+        object.__setattr__(self, "duration", float(self.duration))
         if self.duration <= 0:
             raise ValueError("duration must be positive")
