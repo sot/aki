@@ -522,8 +522,7 @@ def star_track_numba(
         bgd = BgdLegacy()
     if not isinstance(bgd, (BgdLegacy, BgdStatic)):
         raise TypeError(f"bgd must be BgdLegacy or BgdStatic, got {type(bgd).__name__}")
-    bgd_mode, bgd_img = bgd.prepare()
-    if bgd_mode == BGD_MODE_IMAGE and bgd_img.shape != dark.shape:
+    if bgd.mode == BGD_MODE_IMAGE and bgd.image.shape != dark.shape:
         raise ValueError("bgd image must have the same shape as dark")
 
     # Below this threshold stop tracking
@@ -578,8 +577,8 @@ def star_track_numba(
             star_norms,
             star_img,
             dark,
-            bgd_mode,
-            bgd_img,
+            bgd.mode,
+            bgd.image,
             min_img_sum,
             img_row,
             img_col,

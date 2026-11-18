@@ -6,6 +6,7 @@ from chandra_aca.transform import count_rate_to_mag
 
 from aki import (
     BGD_MODE_IMAGE,
+    BGD_MODE_LEGACY,
     BgdLegacy,
     BgdStatic,
     DarkStatic,
@@ -110,11 +111,15 @@ def test_bad_image_shape(cls):
         cls(image=np.zeros((8, 8)))
 
 
-def test_bgd_prepare():
-    mode, img = BgdStatic.from_pixels({(0, 0): 5.0}).prepare()
-    assert mode == BGD_MODE_IMAGE
-    assert img[512, 512] == 5.0
-    assert BgdLegacy().prepare()[1].shape == (0, 0)
+def test_bgd_mode_and_image():
+    bgd = BgdStatic.from_pixels({(0, 0): 5.0})
+    assert bgd.mode == BGD_MODE_IMAGE
+    assert bgd.image[512, 512] == 5.0
+    legacy = BgdLegacy()
+    assert legacy.mode == BGD_MODE_LEGACY
+    assert legacy.image.shape == (0, 0)
+    assert legacy.image.dtype == np.float64
+    assert repr(legacy) == "BgdLegacy()"
 
 
 def test_config_validation():

@@ -29,6 +29,7 @@ Use ``dataclasses.replace`` to vary one option::
 """
 
 from dataclasses import dataclass, field, fields
+from typing import ClassVar
 
 import numpy as np
 
@@ -50,6 +51,9 @@ CCD_SHAPE = (1024, 1024)
 # Background mode codes passed to the numba tracking kernel
 BGD_MODE_LEGACY = 0
 BGD_MODE_IMAGE = 1
+
+_EMPTY_IMAGE = np.zeros((0, 0), dtype=np.float64)
+_EMPTY_IMAGE.flags.writeable = False
 
 
 def _as_readonly_ccd_image(image, name: str) -> np.ndarray:
@@ -150,9 +154,9 @@ class BgdLegacy:
     See ``aki.calc_legacy_flight_bgd``.
     """
 
-    def prepare(self) -> tuple[int, np.ndarray]:
-        """Mode code and (unused) background image for the tracking kernel."""
-        return BGD_MODE_LEGACY, np.zeros((0, 0), dtype=np.float64)
+    mode: ClassVar[int] = BGD_MODE_LEGACY
+    # Placeholder so the tracking kernel always gets a float64 2-d array
+    image: ClassVar[np.ndarray] = _EMPTY_IMAGE
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -170,6 +174,7 @@ class BgdStatic:
         ``[row + 512, col + 512]``. A read-only copy is stored.
     """
 
+    mode: ClassVar[int] = BGD_MODE_IMAGE
     image: np.ndarray
 
     def __post_init__(self):
@@ -185,10 +190,6 @@ class BgdStatic:
         See ``DarkStatic.from_pixels``.
         """
         return cls(image=_ccd_image_from_pixels(pixels, background))
-
-    def prepare(self) -> tuple[int, np.ndarray]:
-        """Mode code and full-CCD background image for the tracking kernel."""
-        return BGD_MODE_IMAGE, self.image
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
