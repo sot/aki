@@ -1,4 +1,5 @@
 import itertools
+from typing import TYPE_CHECKING
 
 import agasc
 import numba
@@ -11,7 +12,16 @@ from cxotime import CxoTime
 from mica.archive.aca_dark import get_dark_cal_image
 from ska_trend.centroid_dashboard import app as cent_app
 
-__all__ = ["calc_legacy_flight_bgd", "centroid_fm"]
+from aki.config import BGD_MODE_IMAGE, BGD_MODE_LEGACY
+
+if TYPE_CHECKING:
+    from aki.config import SimConfig
+
+__all__ = ["DT_READOUT", "calc_legacy_flight_bgd", "centroid_fm", "simulate"]
+
+# Time between simulated image readouts (s). The GS loss logic in _advance_readout
+# assumes this value.
+DT_READOUT = 2.05
 
 # Row and col positions for legacy flight background for calc_legacy_flight_bgd.
 # Performance note: keeping this outside the function is faster.
@@ -309,6 +319,8 @@ def _advance_readout(
     star_norms,
     star_img,
     dark,
+    bgd_mode,
+    bgd_img,
     min_img_sum,
     img_row,
     img_col,
@@ -335,7 +347,14 @@ def _advance_readout(
     star_img : np.ndarray
         8x8 scratch array used to hold a star's PSF image.
     dark : np.ndarray
-        Full dark current CCD image (e-/s) used as the image background.
+        Full-CCD true dark current image (e-/s) used as the image background.
+    bgd_mode : int
+        Background estimate to subtract: ``BGD_MODE_LEGACY`` (legacy flight
+        algorithm from the 8x8 corner pixels) or ``BGD_MODE_IMAGE`` (per-pixel
+        values from ``bgd_img``).
+    bgd_img : np.ndarray
+        Full-CCD background estimate image (e-/s) for ``BGD_MODE_IMAGE``. Not
+        used for ``BGD_MODE_LEGACY``.
     min_img_sum : float
         Image flux (e-/s) threshold below which tracking is dropped.
     img_row, img_col, rate_row, rate_col, gs_loss_count, img_track
@@ -377,9 +396,17 @@ def _advance_readout(
     guide_row = guide_row_cat + dither_r
     guide_col = guide_col_cat + dither_c
 
-    bgd = calc_legacy_flight_bgd(np.asarray(img, dtype=np.float64))
     # Centroid row/col relative to lower left pixel edge at 0, 0
-    cent_row0, cent_col0, img_sum = centroid_fm(img, bgd)
+    if bgd_mode == BGD_MODE_LEGACY:
+        bgd = calc_legacy_flight_bgd(np.asarray(img, dtype=np.float64))
+        cent_row0, cent_col0, img_sum = centroid_fm(img, bgd)
+    elif bgd_mode == BGD_MODE_IMAGE:
+        bgd_8x8 = bgd_img[
+            img_row0 + 512 : img_row0 + 512 + 8, img_col0 + 512 : img_col0 + 512 + 8
+        ].copy()
+        cent_row0, cent_col0, img_sum = centroid_fm(img, bgd_8x8)
+    else:
+        raise ValueError("unknown bgd_mode")
     # Centroid row/col in absolute coordinates (with 0, 0 at the CCD center)
     cent_row = cent_row0 + img_row0
     cent_col = cent_col0 + img_col0
@@ -433,7 +460,16 @@ def _advance_readout(
     )
 
 
-def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
+def star_track_numba(
+    guide,
+    dither_rs,
+    dither_cs,
+    dark: np.ndarray,
+    stars,
+    *,
+    bgd_mode: int = BGD_MODE_LEGACY,
+    bgd_img: np.ndarray | None = None,
+):
     """Simulate ACA image-readout tracking of a single guide star over time.
 
     For each dither offset in ``dither_rs``/``dither_cs``, this synthesizes an 8x8
@@ -456,6 +492,11 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
         Full dark current CCD image (e-/s) used as the image background.
     stars : dict-like / table
         Candidate stars near the guide star, with fields ``row``, ``col``, ``mag``.
+    bgd_mode : int, optional
+        Background estimate subtracted before centroiding, ``BGD_MODE_LEGACY``
+        (default) or ``BGD_MODE_IMAGE``.
+    bgd_img : np.ndarray, optional
+        Full-CCD background estimate image (e-/s), required for ``BGD_MODE_IMAGE``.
 
     Returns
     -------
@@ -479,6 +520,17 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
     )
     # print(star_norms)
     star_img = np.empty((8, 8), dtype=float)
+
+    if bgd_mode == BGD_MODE_IMAGE:
+        if bgd_img is None or bgd_img.shape != dark.shape:
+            raise ValueError(
+                "BGD_MODE_IMAGE requires bgd_img with the same shape as dark"
+            )
+    elif bgd_mode != BGD_MODE_LEGACY:
+        raise ValueError(f"unknown bgd_mode {bgd_mode!r}")
+    if bgd_img is None:
+        bgd_img = np.zeros((0, 0), dtype=np.float64)
+    bgd_img = np.asarray(bgd_img, dtype=np.float64)
 
     # Below this threshold stop tracking
     min_img_sum = float(transform.mag_to_count_rate(guide["maxmag"])) / 2
@@ -532,6 +584,8 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
             star_norms,
             star_img,
             dark,
+            bgd_mode,
+            bgd_img,
             min_img_sum,
             img_row,
             img_col,
@@ -543,7 +597,7 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
         img_tracks[idx] = img_track
 
     out = {
-        "time": np.arange(n_sim) * 2.05,
+        "time": np.arange(n_sim) * DT_READOUT,
         "star_row": star_rows,
         "star_col": star_cols,
         "cent_row": cent_rows,
@@ -554,6 +608,41 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
         "img_track": img_tracks,
     }
 
+    return out
+
+
+def simulate(guide, stars, cfg: "SimConfig"):
+    """Simulate tracking one guide star using a ``SimConfig``.
+
+    Parameters
+    ----------
+    guide : dict-like
+        Guide star catalog entry with fields ``row``, ``col`` and ``maxmag`` (edge
+        pixel coordinates). See ``star_track_numba``.
+    stars : dict-like / table
+        Stars near the guide star, with fields ``row``, ``col``, ``mag``. Include the
+        guide star itself.
+    cfg : SimConfig
+        Simulation configuration.
+
+    Returns
+    -------
+    dict
+        Per-readout arrays from ``star_track_numba`` plus ``config`` (``cfg``).
+    """
+    times = np.arange(0.0, cfg.duration, DT_READOUT)
+    dither_rs, dither_cs = cfg.dither.get_offsets(times)
+    bgd_mode, bgd_img = cfg.bgd.prepare()
+    out = star_track_numba(
+        guide,
+        dither_rs,
+        dither_cs,
+        cfg.dark.get_image(),
+        stars,
+        bgd_mode=bgd_mode,
+        bgd_img=bgd_img,
+    )
+    out["config"] = cfg
     return out
 
 
@@ -636,7 +725,7 @@ def run_aki_from_sim_obs(
             ao.obs.start, select="nearest", t_ccd_ref=ao.obs.t_ccd
         )
 
-    dt = 2.05
+    dt = DT_READOUT
     n_read = int(duration // dt)
     times = np.arange(n_read) * dt
 
