@@ -1,4 +1,5 @@
 import itertools
+from typing import TYPE_CHECKING
 
 import agasc
 import numba
@@ -11,7 +12,23 @@ from cxotime import CxoTime
 from mica.archive.aca_dark import get_dark_cal_image
 from ska_trend.centroid_dashboard import app as cent_app
 
-__all__ = ["calc_legacy_flight_bgd", "centroid_fm"]
+from aki.config import (
+    BGD_MODE_DYNAMIC,
+    BGD_MODE_IMAGE,
+    BGD_MODE_LEGACY,
+    BgdDynamic,
+    BgdLegacy,
+    BgdStatic,
+)
+
+if TYPE_CHECKING:
+    from aki.config import SimConfig
+
+__all__ = ["DT_READOUT", "calc_legacy_flight_bgd", "centroid_fm", "simulate"]
+
+# Time between simulated image readouts (s). The GS loss logic in _advance_readout
+# assumes this value.
+DT_READOUT = 2.05
 
 # Row and col positions for legacy flight background for calc_legacy_flight_bgd.
 # Performance note: keeping this outside the function is faster.
@@ -224,6 +241,176 @@ def get_psf_image_from_grid(row: float, col: float, norm: float, img: np.ndarray
     return row_int - 4, col_int - 4
 
 
+# 8x8 pixels outside the 6x6 mouse-bitten centroid region (edge ring plus the 4
+# corners of the 6x6). These are sampled by the dynamic background.
+DYN_BGD_ROWS = np.array(
+    [0] * 8 + [7] * 8 + [1, 2, 3, 4, 5, 6] * 2 + [1, 6, 1, 6], dtype=np.int64
+)
+DYN_BGD_COLS = np.array(
+    list(range(8)) * 2 + [0] * 6 + [7] * 6 + [1, 1, 6, 6], dtype=np.int64
+)
+# Dynamic background stack: N_DYN_BGD layers of DYN_BGD_SIZE x DYN_BGD_SIZE pixels
+N_DYN_BGD = 5
+DYN_BGD_SIZE = 16
+# Min outer value (e-/s) above which the legacy flat background is used (PR-453 17c)
+DYN_BGD_OUTER_MIN_THRESH = 500.0
+# Value (e-/s) of dynamic background stack pixels not yet sampled (PR-453 2b)
+DYN_BGD_STACK_INIT = 0.0
+
+
+@numba.njit()
+def median5(v0, v1, v2, v3, v4):
+    """Median of five values using 6 comparisons (from annie ``calc_median``)."""
+    if v0 < v1:
+        v0, v1 = v1, v0
+    if v2 < v3:
+        v2, v3 = v3, v2
+    if v0 < v2:
+        v0, v2 = v2, v0
+        v1, v3 = v3, v1
+    if v1 < v4:
+        v1, v4 = v4, v1
+    if v1 > v2:
+        return v2 if v2 > v4 else v4
+    elif v1 > v3:
+        return v1
+    else:
+        return v3
+
+
+@numba.njit()
+def _shift_dyn_bgd_stack(stack, dr, dc, fill):
+    """Shift ``stack`` in-place so new[:, r, c] = old[:, r + dr, c + dc].
+
+    Pixels with no source in the old stack are set to ``fill``.
+    """
+    nstack, nrow, ncol = stack.shape
+    if dr > 0:
+        r0, r1, rd = 0, nrow, 1
+    else:
+        r0, r1, rd = nrow - 1, -1, -1
+    if dc > 0:
+        c0, c1, cd = 0, ncol, 1
+    else:
+        c0, c1, cd = ncol - 1, -1, -1
+    for r in range(r0, r1, rd):
+        rn = r + dr
+        for c in range(c0, c1, cd):
+            cn = c + dc
+            inside = rn >= 0 and rn < nrow and cn >= 0 and cn < ncol
+            for k in range(nstack):
+                stack[k, r, c] = stack[k, rn, cn] if inside else fill
+
+
+@numba.njit()
+def _drag_dyn_bgd_stack(stack, stack_state, img_row0, img_col0, fill):
+    """Move the stack (if needed) so the 8x8 readout window is fully inside it.
+
+    Returns the readout window lower-left corner relative to the stack.
+    """
+    dr = img_row0 - stack_state[0]
+    if dr > 0:
+        dr = max(dr - (DYN_BGD_SIZE - 8), 0)
+    dc = img_col0 - stack_state[1]
+    if dc > 0:
+        dc = max(dc - (DYN_BGD_SIZE - 8), 0)
+    if dr != 0 or dc != 0:
+        _shift_dyn_bgd_stack(stack, dr, dc, fill)
+        stack_state[0] += dr
+        stack_state[1] += dc
+    return img_row0 - stack_state[0], img_col0 - stack_state[1]
+
+
+@numba.njit()
+def _reset_dyn_bgd_stack(stack, stack_state):
+    """Fill the dynamic background stack with ``DYN_BGD_STACK_INIT`` and reset it."""
+    stack[:] = DYN_BGD_STACK_INIT
+    stack_state[0] = -512
+    stack_state[1] = -512
+    stack_state[2] = 0
+
+
+@numba.njit()
+def calc_dynamic_bgd(
+    img,
+    img_row0,
+    img_col0,
+    stack,
+    stack_state,
+    update,
+):
+    """Dynamic background estimate for one 8x8 readout (annie ``DynamicBgd2``).
+
+    Parameters
+    ----------
+    img : np.ndarray
+        8x8 readout image (e-/s).
+    img_row0, img_col0 : int
+        Readout image lower-left corner in absolute pixel coordinates.
+    stack : np.ndarray
+        (5, 16, 16) background stack (e-/s), updated in-place.
+    stack_state : np.ndarray
+        int64 array ``[stack_row0, stack_col0, layer]`` giving the stack lower-left
+        corner in absolute pixel coordinates and the next layer to write. Updated
+        in-place.
+    update : bool
+        Write the outer pixels of ``img`` into the stack (tracking). If False only
+        the stack position is updated.
+
+    Returns
+    -------
+    np.ndarray
+        8x8 background estimate (e-/s). For the dynamic background this is capped
+        at ``img`` so the subtracted pixels are not negative. For the legacy
+        fallback it is the flat legacy value.
+    """
+    # Min outer value, ignoring negative pixels and 0 if all are negative (PR-453
+    # req 17a).
+    outer_min = np.inf
+    for ii in range(DYN_BGD_ROWS.shape[0]):
+        val = img[DYN_BGD_ROWS[ii], DYN_BGD_COLS[ii]]
+        if val >= 0.0 and val < outer_min:
+            outer_min = val
+    if outer_min == np.inf:
+        outer_min = 0.0
+
+    bgd = np.empty((8, 8), dtype=np.float64)
+    if outer_min > DYN_BGD_OUTER_MIN_THRESH:
+        # High background: legacy flat background, nothing stored (req 17c)
+        bgd[:] = calc_legacy_flight_bgd(img)
+        return bgd
+    else:
+        r_off, c_off = _drag_dyn_bgd_stack(
+            stack, stack_state, img_row0, img_col0, DYN_BGD_STACK_INIT
+        )
+        if update:
+            layer = stack_state[2]
+            for ii in range(DYN_BGD_ROWS.shape[0]):
+                r = DYN_BGD_ROWS[ii]
+                c = DYN_BGD_COLS[ii]
+                stack[layer, r_off + r, c_off + c] = img[r, c]
+            stack_state[2] = (layer + 1) % N_DYN_BGD
+
+        for r in range(8):
+            for c in range(8):
+                rs = r_off + r
+                cs = c_off + c
+                val = median5(
+                    stack[0, rs, cs],
+                    stack[1, rs, cs],
+                    stack[2, rs, cs],
+                    stack[3, rs, cs],
+                    stack[4, rs, cs],
+                )
+                # Subtract at least the min outer value (req 17b)
+                if val < outer_min:
+                    val = outer_min
+                # Background-subtracted pixel is no less than 0 (req 2c)
+                bgd[r, c] = min(val, img[r, c])
+
+    return bgd
+
+
 @numba.njit()
 def clip(val: int, low: int, high: int):
     """Clip ``val`` to the closed interval ``[low, high]``.
@@ -309,6 +496,10 @@ def _advance_readout(
     star_norms,
     star_img,
     dark,
+    bgd_mode,
+    bgd_img,
+    dyn_stack,
+    dyn_state,
     min_img_sum,
     img_row,
     img_col,
@@ -335,7 +526,17 @@ def _advance_readout(
     star_img : np.ndarray
         8x8 scratch array used to hold a star's PSF image.
     dark : np.ndarray
-        Full dark current CCD image (e-/s) used as the image background.
+        Full-CCD true dark current image (e-/s) used as the image background.
+    bgd_mode : int
+        Background estimate to subtract: ``BGD_MODE_LEGACY`` (legacy flight
+        algorithm from the 8x8 corner pixels), ``BGD_MODE_IMAGE`` (per-pixel
+        values from ``bgd_img``) or ``BGD_MODE_DYNAMIC`` (see ``calc_dynamic_bgd``).
+    bgd_img : np.ndarray
+        Full-CCD background estimate image (e-/s) for ``BGD_MODE_IMAGE``. Not
+        used for other modes.
+    dyn_stack, dyn_state : np.ndarray
+        Dynamic background stack and state, updated in-place for
+        ``BGD_MODE_DYNAMIC``. See ``calc_dynamic_bgd``.
     min_img_sum : float
         Image flux (e-/s) threshold below which tracking is dropped.
     img_row, img_col, rate_row, rate_col, gs_loss_count, img_track
@@ -377,9 +578,27 @@ def _advance_readout(
     guide_row = guide_row_cat + dither_r
     guide_col = guide_col_cat + dither_c
 
-    bgd = calc_legacy_flight_bgd(np.asarray(img, dtype=np.float64))
     # Centroid row/col relative to lower left pixel edge at 0, 0
-    cent_row0, cent_col0, img_sum = centroid_fm(img, bgd)
+    if bgd_mode == BGD_MODE_LEGACY:
+        bgd = calc_legacy_flight_bgd(np.asarray(img, dtype=np.float64))
+        cent_row0, cent_col0, img_sum = centroid_fm(img, bgd)
+    elif bgd_mode == BGD_MODE_IMAGE:
+        bgd_8x8 = bgd_img[
+            img_row0 + 512 : img_row0 + 512 + 8, img_col0 + 512 : img_col0 + 512 + 8
+        ].copy()
+        cent_row0, cent_col0, img_sum = centroid_fm(img, bgd_8x8)
+    elif bgd_mode == BGD_MODE_DYNAMIC:
+        bgd_8x8 = calc_dynamic_bgd(
+            img,
+            img_row0,
+            img_col0,
+            dyn_stack,
+            dyn_state,
+            img_track,
+        )
+        cent_row0, cent_col0, img_sum = centroid_fm(img, bgd_8x8)
+    else:
+        raise ValueError("unknown bgd_mode")
     # Centroid row/col in absolute coordinates (with 0, 0 at the CCD center)
     cent_row = cent_row0 + img_row0
     cent_col = cent_col0 + img_col0
@@ -415,6 +634,8 @@ def _advance_readout(
         img_row = guide_row
         img_col = guide_col
         img_track = True
+        if bgd_mode == BGD_MODE_DYNAMIC:
+            _reset_dyn_bgd_stack(dyn_stack, dyn_state)
 
     return (
         cent_row,
@@ -433,7 +654,15 @@ def _advance_readout(
     )
 
 
-def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
+def star_track_numba(
+    guide,
+    dither_rs,
+    dither_cs,
+    dark: np.ndarray,
+    stars,
+    *,
+    bgd: BgdLegacy | BgdStatic | BgdDynamic | None = None,
+):
     """Simulate ACA image-readout tracking of a single guide star over time.
 
     For each dither offset in ``dither_rs``/``dither_cs``, this synthesizes an 8x8
@@ -456,6 +685,9 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
         Full dark current CCD image (e-/s) used as the image background.
     stars : dict-like / table
         Candidate stars near the guide star, with fields ``row``, ``col``, ``mag``.
+    bgd : BgdLegacy, BgdStatic or BgdDynamic, optional
+        Background estimate subtracted before centroiding. Default is
+        ``BgdLegacy()`` (legacy flight algorithm).
 
     Returns
     -------
@@ -479,6 +711,20 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
     )
     # print(star_norms)
     star_img = np.empty((8, 8), dtype=float)
+
+    if bgd is None:
+        bgd = BgdLegacy()
+    if not isinstance(bgd, (BgdLegacy, BgdStatic, BgdDynamic)):
+        raise TypeError(
+            f"bgd must be BgdLegacy, BgdStatic or BgdDynamic, got {type(bgd).__name__}"
+        )
+    if bgd.mode == BGD_MODE_IMAGE and bgd.image.shape != dark.shape:
+        raise ValueError("bgd image must have the same shape as dark")
+
+    # Dynamic background state (allocated for every mode to keep numba types fixed)
+    dyn_stack = np.empty((N_DYN_BGD, DYN_BGD_SIZE, DYN_BGD_SIZE), dtype=np.float64)
+    dyn_state = np.empty(3, dtype=np.int64)
+    _reset_dyn_bgd_stack(dyn_stack, dyn_state)
 
     # Below this threshold stop tracking
     min_img_sum = float(transform.mag_to_count_rate(guide["maxmag"])) / 2
@@ -532,6 +778,10 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
             star_norms,
             star_img,
             dark,
+            bgd.mode,
+            bgd.image,
+            dyn_stack,
+            dyn_state,
             min_img_sum,
             img_row,
             img_col,
@@ -543,7 +793,7 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
         img_tracks[idx] = img_track
 
     out = {
-        "time": np.arange(n_sim) * 2.05,
+        "time": np.arange(n_sim) * DT_READOUT,
         "star_row": star_rows,
         "star_col": star_cols,
         "cent_row": cent_rows,
@@ -554,6 +804,39 @@ def star_track_numba(guide, dither_rs, dither_cs, dark: np.ndarray, stars):
         "img_track": img_tracks,
     }
 
+    return out
+
+
+def simulate(guide, stars, cfg: "SimConfig"):
+    """Simulate tracking one guide star using a ``SimConfig``.
+
+    Parameters
+    ----------
+    guide : dict-like
+        Guide star catalog entry with fields ``row``, ``col`` and ``maxmag`` (edge
+        pixel coordinates). See ``star_track_numba``.
+    stars : dict-like / table
+        Stars near the guide star, with fields ``row``, ``col``, ``mag``. Include the
+        guide star itself.
+    cfg : SimConfig
+        Simulation configuration.
+
+    Returns
+    -------
+    dict
+        Per-readout arrays from ``star_track_numba`` plus ``config`` (``cfg``).
+    """
+    times = np.arange(0.0, cfg.duration, DT_READOUT)
+    dither_rs, dither_cs = cfg.dither.get_offsets(times)
+    out = star_track_numba(
+        guide,
+        dither_rs,
+        dither_cs,
+        cfg.dark.get_image(),
+        stars,
+        bgd=cfg.bgd,
+    )
+    out["config"] = cfg
     return out
 
 
@@ -636,7 +919,7 @@ def run_aki_from_sim_obs(
             ao.obs.start, select="nearest", t_ccd_ref=ao.obs.t_ccd
         )
 
-    dt = 2.05
+    dt = DT_READOUT
     n_read = int(duration // dt)
     times = np.arange(n_read) * dt
 
