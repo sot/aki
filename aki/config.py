@@ -55,9 +55,6 @@ BGD_MODE_LEGACY = 0
 BGD_MODE_IMAGE = 1
 BGD_MODE_DYNAMIC = 2
 
-# 10 DN in e-/s for a 1.696 s integration at 5 e-/DN (initial dynamic bgd stack value)
-_DYN_BGD_STACK_INIT = 10 * 5 / 1.696
-
 _EMPTY_IMAGE = np.zeros((0, 0), dtype=np.float64)
 _EMPTY_IMAGE.flags.writeable = False
 
@@ -200,45 +197,35 @@ class BgdStatic:
 
 @dataclass(frozen=True, kw_only=True)
 class BgdDynamic:
-    """Dynamic background (annie ``DynamicBgd2``).
+    """PEA dynamic background (flight patch PR-453, annie ``DynamicBgd2``).
 
-    Each tracked readout writes the 32 pixels outside the 6x6 centroid region (the
-    8x8 edge ring plus the four 6x6 corners) into one layer of a 5-deep stack of
-    16x16 CCD-fixed images that follows the readout window. The background for each
-    of the 8x8 pixels is the median of the 5 stack values at that CCD pixel. The
-    estimate is then capped at the image value to prevent over-subtraction.
+    There are no options: the algorithm is fixed to the flight patch requirements
+    (PR-453, 2021). The constants are ``aki.aki.DYN_BGD_OUTER_MIN_THRESH`` (500
+    e-/s) and ``aki.aki.DYN_BGD_STACK_INIT`` (0).
 
-    If the minimum of those 32 pixels exceeds ``outer_min_thresh`` (e.g. a bright
-    nearby star fills the window), the stack is left untouched and the flat legacy
-    flight background is used for that readout. The stack is cleared when tracking
-    is reset after a guide star loss, like annie's default
-    ``clear_bgd_stack_on_search=True``.
-
-    Parameters
-    ----------
-    outer_min_thresh : float
-        Threshold (e-/s) on the minimum outer pixel value above which the legacy
-        flat background is used. Default 500.
-    use_outer_min : bool
-        If True, floor the dynamic background at the minimum outer pixel value.
-        Default False.
-    stack_init : float
-        Initial value (e-/s) for stack pixels that have not been sampled. Default
-        is 10 DN (about 29.5 e-/s).
+    - Each readout of a tracked star writes the 32 "outer" pixels outside the 6x6
+      centroid region (the 8x8 edge ring plus the four 6x6 corners) into one layer
+      of a 5-deep stack of 16x16 CCD-fixed pixels. The stack follows the readout
+      window, dropping as few stored pixels as possible (reqs 1, 3, 4).
+    - The background for each 8x8 pixel is the median of the 5 stack values at that
+      CCD pixel. Unsampled values are 0 (reqs 2a, 2b). annie's default is
+      10 DN.
+    - The value subtracted is at least the "min outer value", the minimum
+      non-negative outer pixel of the current image (reqs 17a, 17b). This is
+      always on (annie ``use_outer_min=True``).
+    - The subtracted pixel is no less than 0 (req 2c).
+    - The background is subtracted for a lost star (not tracking), but nothing is
+      stored (req 7).
+    - If the min outer value exceeds 500 e-/s the legacy flat background
+      is used for that readout and nothing is stored (req 17c). aki's legacy
+      background has no 1023 DN cap, as with the raised flight cap (req 18).
+    - The stack is cleared when tracking is reset after a guide star loss, which
+      corresponds to the OBC commanding a search (req 8).
     """
 
     mode: ClassVar[int] = BGD_MODE_DYNAMIC
     # Placeholder so the tracking kernel always gets a float64 2-d array
     image: ClassVar[np.ndarray] = _EMPTY_IMAGE
-
-    outer_min_thresh: float = 500.0
-    use_outer_min: bool = False
-    stack_init: float = _DYN_BGD_STACK_INIT
-
-    def __post_init__(self):
-        object.__setattr__(self, "outer_min_thresh", float(self.outer_min_thresh))
-        object.__setattr__(self, "use_outer_min", bool(self.use_outer_min))
-        object.__setattr__(self, "stack_init", float(self.stack_init))
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -255,13 +242,14 @@ class SimConfig:
     dither : SinusoidDither
         Dither pattern.
     bgd : BgdLegacy, BgdStatic or BgdDynamic
-        Background estimate subtracted before centroiding.
+        Background estimate subtracted before centroiding. Default is
+        ``BgdDynamic()``, the flight algorithm since the 2021 PEA patch.
     """
 
     dark: DarkStatic
     duration: float = 1000.0
     dither: SinusoidDither = field(default_factory=SinusoidDither)
-    bgd: BgdLegacy | BgdStatic | BgdDynamic = field(default_factory=BgdLegacy)
+    bgd: BgdLegacy | BgdStatic | BgdDynamic = field(default_factory=BgdDynamic)
 
     def __post_init__(self):
         object.__setattr__(self, "duration", float(self.duration))

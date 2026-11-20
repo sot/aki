@@ -252,6 +252,10 @@ DYN_BGD_COLS = np.array(
 # Dynamic background stack: N_DYN_BGD layers of DYN_BGD_SIZE x DYN_BGD_SIZE pixels
 N_DYN_BGD = 5
 DYN_BGD_SIZE = 16
+# Min outer value (e-/s) above which the legacy flat background is used (PR-453 17c)
+DYN_BGD_OUTER_MIN_THRESH = 500.0
+# Value (e-/s) of dynamic background stack pixels not yet sampled (PR-453 2b)
+DYN_BGD_STACK_INIT = 0.0
 
 
 @numba.njit()
@@ -318,9 +322,9 @@ def _drag_dyn_bgd_stack(stack, stack_state, img_row0, img_col0, fill):
 
 
 @numba.njit()
-def _reset_dyn_bgd_stack(stack, stack_state, stack_init):
-    """Fill the dynamic background stack with ``stack_init`` and reset its state."""
-    stack[:] = stack_init
+def _reset_dyn_bgd_stack(stack, stack_state):
+    """Fill the dynamic background stack with ``DYN_BGD_STACK_INIT`` and reset it."""
+    stack[:] = DYN_BGD_STACK_INIT
     stack_state[0] = -512
     stack_state[1] = -512
     stack_state[2] = 0
@@ -334,9 +338,6 @@ def calc_dynamic_bgd(
     stack,
     stack_state,
     update,
-    outer_min_thresh,
-    use_outer_min,
-    stack_init,
 ):
     """Dynamic background estimate for one 8x8 readout (annie ``DynamicBgd2``).
 
@@ -355,30 +356,32 @@ def calc_dynamic_bgd(
     update : bool
         Write the outer pixels of ``img`` into the stack (tracking). If False only
         the stack position is updated.
-    outer_min_thresh : float
-        Above this minimum outer pixel value (e-/s) use the legacy flat background.
-    use_outer_min : bool
-        Floor the background at the minimum outer pixel value.
-    stack_init : float
-        Value (e-/s) for stack pixels that have not been sampled.
 
     Returns
     -------
     np.ndarray
-        8x8 background estimate (e-/s), capped at ``img``.
+        8x8 background estimate (e-/s). For the dynamic background this is capped
+        at ``img`` so the subtracted pixels are not negative. For the legacy
+        fallback it is the flat legacy value.
     """
+    # Min outer value, ignoring negative pixels and 0 if all are negative (PR-453
+    # req 17a).
     outer_min = np.inf
     for ii in range(DYN_BGD_ROWS.shape[0]):
         val = img[DYN_BGD_ROWS[ii], DYN_BGD_COLS[ii]]
-        if val < outer_min:
+        if val >= 0.0 and val < outer_min:
             outer_min = val
+    if outer_min == np.inf:
+        outer_min = 0.0
 
     bgd = np.empty((8, 8), dtype=np.float64)
-    if outer_min > outer_min_thresh:
+    if outer_min > DYN_BGD_OUTER_MIN_THRESH:
+        # High background: legacy flat background, nothing stored (req 17c)
         bgd[:] = calc_legacy_flight_bgd(img)
+        return bgd
     else:
         r_off, c_off = _drag_dyn_bgd_stack(
-            stack, stack_state, img_row0, img_col0, stack_init
+            stack, stack_state, img_row0, img_col0, DYN_BGD_STACK_INIT
         )
         if update:
             layer = stack_state[2]
@@ -399,15 +402,12 @@ def calc_dynamic_bgd(
                     stack[3, rs, cs],
                     stack[4, rs, cs],
                 )
-                if use_outer_min and val < outer_min:
+                # Subtract at least the min outer value (req 17b)
+                if val < outer_min:
                     val = outer_min
-                bgd[r, c] = val
+                # Background-subtracted pixel is no less than 0 (req 2c)
+                bgd[r, c] = min(val, img[r, c])
 
-    # Prevent over-subtraction
-    for r in range(8):
-        for c in range(8):
-            if bgd[r, c] > img[r, c]:
-                bgd[r, c] = img[r, c]
     return bgd
 
 
@@ -500,9 +500,6 @@ def _advance_readout(
     bgd_img,
     dyn_stack,
     dyn_state,
-    dyn_outer_min_thresh,
-    dyn_use_outer_min,
-    dyn_stack_init,
     min_img_sum,
     img_row,
     img_col,
@@ -540,8 +537,6 @@ def _advance_readout(
     dyn_stack, dyn_state : np.ndarray
         Dynamic background stack and state, updated in-place for
         ``BGD_MODE_DYNAMIC``. See ``calc_dynamic_bgd``.
-    dyn_outer_min_thresh, dyn_use_outer_min, dyn_stack_init
-        Dynamic background options. See ``aki.BgdDynamic``.
     min_img_sum : float
         Image flux (e-/s) threshold below which tracking is dropped.
     img_row, img_col, rate_row, rate_col, gs_loss_count, img_track
@@ -600,9 +595,6 @@ def _advance_readout(
             dyn_stack,
             dyn_state,
             img_track,
-            dyn_outer_min_thresh,
-            dyn_use_outer_min,
-            dyn_stack_init,
         )
         cent_row0, cent_col0, img_sum = centroid_fm(img, bgd_8x8)
     else:
@@ -643,7 +635,7 @@ def _advance_readout(
         img_col = guide_col
         img_track = True
         if bgd_mode == BGD_MODE_DYNAMIC:
-            _reset_dyn_bgd_stack(dyn_stack, dyn_state, dyn_stack_init)
+            _reset_dyn_bgd_stack(dyn_stack, dyn_state)
 
     return (
         cent_row,
@@ -730,10 +722,9 @@ def star_track_numba(
         raise ValueError("bgd image must have the same shape as dark")
 
     # Dynamic background state (allocated for every mode to keep numba types fixed)
-    dyn = bgd if isinstance(bgd, BgdDynamic) else BgdDynamic()
     dyn_stack = np.empty((N_DYN_BGD, DYN_BGD_SIZE, DYN_BGD_SIZE), dtype=np.float64)
     dyn_state = np.empty(3, dtype=np.int64)
-    _reset_dyn_bgd_stack(dyn_stack, dyn_state, dyn.stack_init)
+    _reset_dyn_bgd_stack(dyn_stack, dyn_state)
 
     # Below this threshold stop tracking
     min_img_sum = float(transform.mag_to_count_rate(guide["maxmag"])) / 2
@@ -791,9 +782,6 @@ def star_track_numba(
             bgd.image,
             dyn_stack,
             dyn_state,
-            dyn.outer_min_thresh,
-            dyn.use_outer_min,
-            dyn.stack_init,
             min_img_sum,
             img_row,
             img_col,

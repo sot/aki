@@ -49,7 +49,7 @@ def hot_pixel_config(**kwargs):
 
 def test_simulate_legacy_matches_star_track_numba():
     """simulate() with BgdLegacy reproduces calling the kernel directly."""
-    cfg = hot_pixel_config()
+    cfg = hot_pixel_config(bgd=BgdLegacy())
     out = simulate(GUIDE, STARS, cfg)
 
     times = np.arange(0.0, 5000.0, 2.05)
@@ -186,23 +186,22 @@ def test_median5():
         assert median5(*vals) == np.median(vals)
 
 
-def _new_dyn_stack(init):
+def _new_dyn_stack():
     stack = np.empty((5, 16, 16))
     state = np.empty(3, dtype=np.int64)
-    _reset_dyn_bgd_stack(stack, state, init)
+    _reset_dyn_bgd_stack(stack, state)
     return stack, state
 
 
 def test_calc_dynamic_bgd_median_of_stack():
     """Outer pixels need 3 of 5 samples before the median reflects them."""
-    init = 30.0
-    stack, state = _new_dyn_stack(init)
+    stack, state = _new_dyn_stack()
     img = np.full((8, 8), 100.0)
-    img[0, 3] = 50.0  # outer pixel below init -> capped by image, not median
-    args = (100, -40, stack, state, True, 500.0, False, init)
+    img[0, 3] = 0.0  # min outer value 0 so it does not floor the background
+    args = (100, -40, stack, state, True)
 
     bgd1 = calc_dynamic_bgd(img, *args)
-    assert np.all(bgd1[img > init] == init)
+    np.testing.assert_array_equal(bgd1, 0.0)
     calc_dynamic_bgd(img, *args)
     bgd3 = calc_dynamic_bgd(img, *args)
     outer = np.ones((8, 8), dtype=bool)
@@ -210,33 +209,33 @@ def test_calc_dynamic_bgd_median_of_stack():
     outer[2:6, 1:7] = False
     assert outer.sum() == 32
     np.testing.assert_array_equal(bgd3[outer], img[outer])
-    np.testing.assert_array_equal(bgd3[~outer], init)
+    np.testing.assert_array_equal(bgd3[~outer], 0.0)
     assert state[2] == 3
 
     # Not tracking: stack is not updated
-    calc_dynamic_bgd(img * 2, 100, -40, stack, state, False, 500.0, False, init)
+    calc_dynamic_bgd(img * 2, 100, -40, stack, state, False)
     assert state[2] == 3
 
-    # use_outer_min floors the inner pixels at the outer minimum (50)
-    bgd = calc_dynamic_bgd(img, 100, -40, stack, state, True, 500.0, True, init)
+    # Min outer value (50) floors the inner pixels (stack median is 0)
+    img[0, 3] = 50.0
+    bgd = calc_dynamic_bgd(img, 100, -40, stack, state, False)
     assert np.all(bgd[~outer] == 50.0)
 
 
 def test_calc_dynamic_bgd_threshold_uses_legacy():
-    stack, state = _new_dyn_stack(30.0)
+    stack, state = _new_dyn_stack()
     img = np.full((8, 8), 600.0)
     img[3, 3] = 5000.0
-    bgd = calc_dynamic_bgd(img, 0, 0, stack, state, True, 500.0, False, 30.0)
+    bgd = calc_dynamic_bgd(img, 0, 0, stack, state, True)
     np.testing.assert_array_equal(bgd, calc_legacy_flight_bgd(img))
     # Stack not touched
     assert state[2] == 0
-    assert np.all(stack == 30.0)
+    assert np.all(stack == 0.0)
 
 
 def test_calc_dynamic_bgd_stack_follows_window():
     """Stack samples stay attached to their CCD pixel as the window moves."""
-    init = -1.0
-    stack, state = _new_dyn_stack(init)
+    stack, state = _new_dyn_stack()
     ccd = np.random.default_rng(1).uniform(50, 100, (64, 64))
     rng = np.random.default_rng(2)
     r0, c0 = 28, 28
@@ -244,26 +243,28 @@ def test_calc_dynamic_bgd_stack_follows_window():
         r0 = int(np.clip(r0 + rng.integers(-2, 3), 0, 56))
         c0 = int(np.clip(c0 + rng.integers(-2, 3), 0, 56))
         img = ccd[r0 : r0 + 8, c0 : c0 + 8]
-        calc_dynamic_bgd(img, r0, c0, stack, state, True, 500.0, False, init)
+        calc_dynamic_bgd(img, r0, c0, stack, state, True)
         # Window is inside the 16x16 stack
         assert 0 <= r0 - state[0] <= 8 and 0 <= c0 - state[1] <= 8
         # Every sampled stack value is the true CCD value at that absolute pixel
         rows, cols = np.ogrid[state[0] : state[0] + 16, state[1] : state[1] + 16]
         in_ccd = (rows >= 0) & (rows < 64) & (cols >= 0) & (cols < 64)
         truth = np.where(in_ccd, ccd[rows.clip(0, 63), cols.clip(0, 63)], np.nan)
-        sampled = stack != init
+        sampled = stack != 0.0  # CCD values are all > 0
         assert np.all(stack[sampled] == np.broadcast_to(truth, stack.shape)[sampled])
-    assert np.count_nonzero(stack != init) > 200
+    assert np.count_nonzero(stack) > 200
 
 
 def test_bgd_dynamic_config():
-    bgd = BgdDynamic(outer_min_thresh=400, use_outer_min=1, stack_init=np.float64(5))
+    bgd = BgdDynamic()
     assert bgd.mode == BGD_MODE_DYNAMIC
     assert bgd.image.shape == (0, 0)
-    assert type(bgd.outer_min_thresh) is float
-    assert bgd.use_outer_min is True
-    assert type(bgd.stack_init) is float
-    assert BgdDynamic().stack_init == pytest.approx(10 * 5 / 1.696)
+    assert repr(bgd) == "BgdDynamic()"
+    # No options: fixed to the flight algorithm
+    with pytest.raises(TypeError):
+        BgdDynamic(outer_min_thresh=400.0)
+    # Flight algorithm is the SimConfig default
+    assert SimConfig(dark=DarkStatic.from_pixels({})).bgd == BgdDynamic()
 
 
 def test_dynamic_bgd_reduces_hot_pixel_error():
@@ -278,3 +279,37 @@ def test_dynamic_bgd_reduces_hot_pixel_error():
     rms_dynamic = rms_dy(BgdDynamic())
     rms_static = rms_dy(BgdStatic(image=cfg.dark.image))
     assert rms_static < rms_dynamic < rms_legacy / 2
+
+
+def test_calc_dynamic_bgd_min_outer_value():
+    """Min outer value ignores negative pixels and is 0 if all are negative."""
+    stack, state = _new_dyn_stack()
+    img = np.full((8, 8), 100.0)
+    img[0, :] = -5.0  # negative outer pixels are ignored
+    img[7, 2] = 40.0  # -> min outer value is 40
+    bgd = calc_dynamic_bgd(img, 0, 0, stack, state, True)
+    # Stack medians are 0 after one readout, so the min outer value is used,
+    # capped at the image value (subtracted pixel >= 0)
+    np.testing.assert_array_equal(bgd, np.minimum(40.0, img))
+
+    stack, state = _new_dyn_stack()
+    img = np.full((8, 8), 100.0)
+    img[0, :] = -5.0
+    img[7, :] = -5.0
+    img[1:7, 0] = -5.0
+    img[1:7, 7] = -5.0
+    img[[1, 1, 6, 6], [1, 6, 1, 6]] = -5.0
+    bgd = calc_dynamic_bgd(img, 0, 0, stack, state, True)
+    np.testing.assert_array_equal(bgd, np.minimum(0.0, img))
+
+
+def test_calc_dynamic_bgd_legacy_fallback_not_capped():
+    """Legacy flat fallback is not capped at the image (req 2c is dynamic only)."""
+    stack, state = _new_dyn_stack()
+    img = np.full((8, 8), 600.0)
+    img[0, 0] = 2000.0
+    img[3, 3] = 550.0  # inner pixel below the flat legacy value
+    bgd = calc_dynamic_bgd(img, 0, 0, stack, state, True)
+    legacy = calc_legacy_flight_bgd(img)
+    assert legacy > 550.0
+    np.testing.assert_array_equal(bgd, legacy)
